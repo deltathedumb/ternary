@@ -440,6 +440,7 @@ class Core(threading.Thread):
         self.PC = Trite(trits=16)
         self.SP = Trite(trits=16)
         self.FP = Trite(trits=16)
+        self.PSR = Trite(trits=16)  # power state register
         self.FLAGS = 0
         self.HALTED = False
         self._jumped = False
@@ -495,6 +496,12 @@ class Core(threading.Thread):
         if self.HALTED:
             return
 
+        if self.PSR == Trite(trits=16).from_str("0+0000000000000000"):
+            self.system.stop_all()
+            self.system.start_all()
+        elif self.PSR == Trite(trits=16).from_str("+00000000000000000"):
+            self.system.stop_all()
+
         header = self.system.mem.get(self.PC)
         opcode_str = str(header[:6])
 
@@ -536,7 +543,7 @@ class Core(threading.Thread):
 
     def run(self):
         """The main execution loop for this core."""
-        while not self.HALTED:
+        while not self.PSR == Trite(trits=16).from_str("0000000000000000"):
             self.step()
 
 
@@ -633,10 +640,15 @@ class TernarySystem:
             gpu_core.start()
 
     def stop_all(self):
+        state = Trite(trits=16)
         for core in self.cores:
+            state = core.PSR
             core.HALTED = True  # type: ignore
         for _ in self.gpu_cores:
             self.gpu_queue.put(None)  # shutdown sentinel, one per GPU core
+
+        # return last known state
+        return state
 
     def join_all(self):
         for core in self.cores:
@@ -1119,10 +1131,22 @@ def op_rel(self: Core, lock_id):
     self.system.state.release(idx)
 
 
-@ternary_1.instruction("00-+-0")
+@ternary_1.instruction("00-+++")
 def op_coreid(self: Core, dst):
     """Loads the executing Core's hardware ID into the destination register."""
     self.r(dst).from_int(self.core_id)
+
+
+@ternary_1.instruction("00-+-+")
+def op_numcores(self: Core, dst):
+    """Loads the number of hardware cores into the destination register."""
+    self.r(dst).from_int(self.system.num_cores)
+
+
+@ternary_1.instruction("00-+-0")
+def op_numgcores(self: Core, dst):
+    """Loads the number of graphical (GPU) cores into the destination register."""
+    self.r(dst).from_int(self.system.num_graphical_cores)
 
 
 # Initialize a Dual-Core System
