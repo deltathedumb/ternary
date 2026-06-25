@@ -13,7 +13,7 @@ import time
 
 import pygame  # type: ignore
 
-from cpu import TernarySystem, ternary_1, encode_instruction, Immediate, GPU
+from cpu import TernarySystem, ternary_1, encode_instruction, Immediate, Trite, GPU
 
 # --- Layout ---------------------------------------------------------------
 VRAM_W = 243
@@ -39,19 +39,32 @@ DIVIDER = (45, 48, 62)
 
 
 # ---- Demo program --------------------------------------------------------
-# Gradient animation: every CPU core runs the identical program, but each
-# claims its own disjoint horizontal band of the framebuffer (via COREID)
-# and only ever fills that band -- not the whole screen. With every core
-# racing to FILL the *same* pixels (the original version), whichever job
-# happened to land last each frame won, and with many GPU workers draining
-# out of order that produced visible flicker. Disjoint regions mean no two
-# cores ever write the same pixel, so there's nothing to race over,
-# regardless of core/GPU-worker count.
+# Gradient animation using the "uniform buffer" pattern from modern GPUs:
 #
-# Addresses are computed from each instruction's real encoded length (one
-# header word + one word per operand -- see encode_instruction in cpu.py)
-# instead of being hardcoded, so this doesn't silently desync if the
-# instruction encoding ever changes.
+#   HOST (Python display loop) owns the animation clock.  Every display
+#   frame it writes the current color into a reserved memory address
+#   (SYNC_ADDR), exactly like a GPU driver uploading a uniform to a
+#   constant buffer before a draw call.
+#
+#   CORES just load from SYNC_ADDR each iteration and render their band.
+#   No core tracks its own color counter; there is one authoritative
+#   value broadcast to all of them, so they are permanently in phase.
+#
+# This is the same reason GPU shader invocations never drift relative to
+# each other for uniforms: the host is the sole writer, the cores are
+# read-only consumers of that value.
+#
+# Each core still claims its own disjoint horizontal band (via COREID)
+# so no two cores ever write the same pixel -- that fix is kept from the
+# previous tiling solution.
+#
+# Addresses are computed from each instruction's real encoded length
+# (1 header word + 1 word/operand) so this doesn't silently break if
+# the encoding changes.
+
+# Memory address the display loop writes the current color to.
+# Placed well above the program code (program is at most ~20 words).
+SYNC_ADDR = 500
 
 
 def _build_demo(num_cores):
@@ -59,38 +72,41 @@ def _build_demo(num_cores):
 
     # (label_or_None, opcode, operand-builder(labels) -> operands)
     spec = [
-        (None, "00-+++", lambda L: [5]),  # COREID r5
-        (None, "00++0+", lambda L: [6, Immediate(band_height)]),  # MOVI r6, #band_height
-        (None, "000+00", lambda L: [6, 5]),  # MUL r6, r5  -> r5 = core_id * band_height
-        (None, "00++0+", lambda L: [7, Immediate(VRAM_W)]),  # MOVI r7, #VRAM_W
-        (None, "000+00", lambda L: [7, 5]),  # MUL r7, r5  -> r5 = this core's band start addr
-        (None, "00++0+", lambda L: [0, Immediate(-121)]),  # MOVI r0, #-121
+        # ── One-time setup: compute this core's band start address ──────
+        (None, "00-+++", lambda L: [5]),                            # COREID r5
+        (None, "00++0+", lambda L: [6, Immediate(band_height)]),    # MOVI r6, #band_height
+        (None, "000+00", lambda L: [6, 5]),                         # MUL r6, r5  → r5 = core_id * band_height
+        (None, "00++0+", lambda L: [7, Immediate(VRAM_W)]),         # MOVI r7, #VRAM_W
+        (None, "000+00", lambda L: [7, 5]),                         # MUL r7, r5  → r5 = band start pixel addr
+
+        # ── Render loop: read shared color, fill band, repeat ──────────
+        # Load the current color from SYNC_ADDR (the host-written uniform).
+        # This is the constant-buffer read: one memory cell, written only
+        # by the display loop, read by every core each iteration.
         (
             "loop_start",
+            "00000+",
+            lambda L: [Immediate(SYNC_ADDR), 0],                    # LOAD #SYNC_ADDR, r0
+        ),
+        (
+            None,
             "0+0000",
             lambda L: [
                 Immediate(GPU.OPCODE_FILL),
-                5,  # dst_addr = this core's band start (register)
-                Immediate(VRAM_W),  # pitch
-                Immediate(VRAM_W),  # width
-                Immediate(band_height),  # height -- just this core's band
-                0,  # color (register)
+                5,                          # dst_addr register (this core's band)
+                Immediate(VRAM_W),          # pitch
+                Immediate(VRAM_W),          # width
+                Immediate(band_height),     # height (just this core's band)
+                0,                          # color register
                 Immediate(GPU.ROP_COPY),
             ],
         ),
-        (None, "0+000-", lambda L: []),  # GSYNC
-        (None, "000+--", lambda L: [0]),  # INC r0
-        (None, "00+0-0", lambda L: [Immediate(122), 0]),  # CMP #122, r0
-        (None, "00+0++", lambda L: [Immediate(L["reset"])]),  # JGE #reset
-        (None, "000-0-", lambda L: [Immediate(L["loop_start"])]),  # JMP loop_start
-        ("reset", "00++0+", lambda L: [0, Immediate(-121)]),  # MOVI r0, #-121
-        (None, "000-0-", lambda L: [Immediate(L["loop_start"])]),  # JMP loop_start
+        (None, "0+000-", lambda L: []),                             # GSYNC
+        (None, "000-0-", lambda L: [Immediate(L["loop_start"])]),   # JMP loop_start
     ]
 
-    # Pass 1: resolve every label's address. Only the operand *count* matters
-    # for sizing (1 header word + 1 word/operand), so label values used inside
-    # a builder don't need to be correct yet -- pass zeros as placeholders.
-    placeholder = {"loop_start": 0, "reset": 0}
+    # Pass 1: resolve label addresses (only operand count matters for sizing).
+    placeholder = {"loop_start": 0}
     labels = {}
     addr = 0
     for name, opcode, build in spec:
@@ -98,7 +114,7 @@ def _build_demo(num_cores):
             labels[name] = addr
         addr += 1 + len(build(placeholder))
 
-    # Pass 2: build the real operand lists now that every label is known.
+    # Pass 2: build real operand lists with resolved labels.
     return [(opcode, build(labels)) for _, opcode, build in spec]
 
 
@@ -232,6 +248,14 @@ def run_window():
         "prev_gpu": 0,
     }
 
+    # Initialise SYNC_ADDR to the start of the color range so cores have a
+    # valid value the instant they first load it (before the display loop
+    # writes its first update).
+    _COLOR_MIN = -121
+    _COLOR_MAX = 121
+    _host_color = _COLOR_MIN
+    system.mem.set(SYNC_ADDR, Trite().from_int(_host_color))
+
     print(
         f"Starting {len(system.cores)}-CPU / {len(system.gpu_cores)}-GPU ternary system…"
     )
@@ -243,6 +267,15 @@ def run_window():
     try:
         running = True
         while running:
+            # ── Host uniform update ───────────────────────────────────────
+            # Advance the shared color by 1 each display frame and write it
+            # to SYNC_ADDR.  This is the "upload uniform to constant buffer"
+            # step: one write from the host, read by every core next iter.
+            _host_color += 1
+            if _host_color > _COLOR_MAX:
+                _host_color = _COLOR_MIN
+            system.mem.set(SYNC_ADDR, Trite().from_int(_host_color))
+
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     running = False
