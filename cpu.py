@@ -1,6 +1,5 @@
 import os
-import queue
-import threading
+from multiprocessing import Process, Event, Lock, JoinableQueue, RawArray, Value
 
 
 class Trit:
@@ -139,55 +138,61 @@ class Flags:
 
 
 # =========================
-# THREAD-SAFE MEMORY & BUSES
+# MEMORY (raw int array, shared across processes via RawArray)
 # =========================
 class Memory:
-    def __init__(self, size):
-        self.mem = [Trite() for _ in range(size)]
-        self.lock = threading.Lock()
+    def __init__(self, size, trit_width=8):
+        self._trit_width = trit_width
+        self._raw = RawArray('i', size)
+        self._lock = Lock()
 
-    def get(self, addr):
-        with self.lock:
-            # In Multithreading, returning a reference is DANGEROUS!
-            # We must return a clone so cores don't accidentally mutate shared memory.
-            original = self.mem[int(addr)]
-            clone = Trite(trits=len(original.trits))
-            return clone.clone_from(original)
+    @property
+    def mem(self):
+        # backward compat: len(system.mem.mem) still works
+        return self._raw
+
+    def get(self, addr) -> 'Trite':
+        with self._lock:
+            val = self._raw[int(addr)]
+        return Trite(trits=self._trit_width).from_int(val)
 
     def set(self, addr, val):
-        with self.lock:
-            self.mem[int(addr)].clone_from(val)
+        with self._lock:
+            self._raw[int(addr)] = int(val)
+
+    @property
+    def lock(self):
+        return self._lock
 
 
+# =========================
+# VIDEO MEMORY (raw ints: 5-trit pixel values in [-121, 121])
+# =========================
 class VideoMemory:
     def __init__(self, size):
-        self.vmem = [Trite(trits=5) for _ in range(size)]
-        self.lock = threading.Lock()
+        self._raw = RawArray('i', size)
+        self._lock = Lock()
 
-    def get(self, addr):
-        with self.lock:
-            original = self.vmem[int(addr)]
-            clone = Trite(trits=5)
-            return clone.clone_from(original)
+    def get(self, addr) -> int:
+        return self._raw[int(addr)]
 
     def set(self, addr, val):
-        with self.lock:
-            self.vmem[int(addr)].clone_from(val)
+        self._raw[int(addr)] = int(val)
+
+    @property
+    def lock(self):
+        return self._lock
+
+    @property
+    def vmem(self):
+        # backward compat for display code that reads system.vmem.vmem
+        return self._raw
 
 
 # =========================
-# GPU (2D BLITTER)
+# GPU (fill, blit, line -- operates directly on raw int vmem)
 # =========================
 class GPU:
-    """A small blitter modeled on classic 2D accelerator hardware (Amiga
-    Blitter / VGA BitBLT engines): linear address + pitch addressing (no
-    x/y coordinate registers) and raster-op (ROP) compositing instead of
-    a plain overwrite. Dispatched from the CPU via the single GPROC
-    instruction, so a whole fill/blit/line completes as one native
-    Python loop instead of one ternary instruction (and one vmem.lock
-    acquisition) per pixel.
-    """
-
     OPCODE_FILL = 0
     OPCODE_BLIT = 1
     OPCODE_LINE = 2
@@ -202,6 +207,12 @@ class GPU:
     def __init__(self, vmem: "VideoMemory"):
         self.vmem = vmem
 
+    @staticmethod
+    def _clamp(val, limit=121):
+        if val > limit or val < -limit:
+            return val % (limit * 2 + 1)
+        return val
+
     def _combine(self, rop, src, dst):
         if rop == self.ROP_XOR:
             return src ^ dst
@@ -210,64 +221,53 @@ class GPU:
         if rop == self.ROP_OR:
             return src | dst
         if rop == self.ROP_ADD:
-            return src + dst
+            return self._clamp(src + dst)
         if rop == self.ROP_SUB:
-            return dst - src
-        return src  # ROP_COPY (and any unrecognised code)
-
-    def _write(self, cell, value):
-        # Mirrors op_add/op_sub's own overflow handling: wrap rather than
-        # raise, since a ROP_ADD/ROP_SUB can legitimately overflow a
-        # pixel's 5-trit range.
-        try:
-            cell.from_int(value)
-        except SignalCarry:
-            cell.from_int(value % (cell.limit * 2))
+            return self._clamp(dst - src)
+        return src  # ROP_COPY
 
     def fill(self, dst_addr, pitch, width, height, color, rop):
-        buf = self.vmem.vmem
-        size = len(buf)
-        with self.vmem.lock:
+        raw = self.vmem._raw
+        size = len(raw)
+        with self.vmem._lock:
             for row in range(height):
                 base = dst_addr + row * pitch
                 if base < 0 or base + width > size:
                     continue
                 for col in range(width):
-                    cell = buf[base + col]
-                    self._write(cell, self._combine(rop, color, int(cell)))
+                    idx = base + col
+                    raw[idx] = self._combine(rop, color, raw[idx])
 
     def blit(self, src_addr, dst_addr, pitch, width, height, rop):
-        buf = self.vmem.vmem
-        size = len(buf)
-        with self.vmem.lock:
+        raw = self.vmem._raw
+        size = len(raw)
+        with self.vmem._lock:
             for row in range(height):
                 srow = src_addr + row * pitch
                 drow = dst_addr + row * pitch
                 if srow < 0 or srow + width > size or drow < 0 or drow + width > size:
                     continue
-                # Snapshot the source row first in case src and dst overlap.
-                src_vals = [int(buf[srow + col]) for col in range(width)]
+                # Snapshot source row before writing to handle src/dst overlap.
+                src_vals = list(raw[srow:srow + width])
                 for col in range(width):
-                    cell = buf[drow + col]
-                    self._write(cell, self._combine(rop, src_vals[col], int(cell)))
+                    raw[drow + col] = self._combine(rop, src_vals[col], raw[drow + col])
 
     def line(self, addr0, addr1, pitch, color, rop):
         x0, y0 = addr0 % pitch, addr0 // pitch
         x1, y1 = addr1 % pitch, addr1 // pitch
-        buf = self.vmem.vmem
-        size = len(buf)
+        raw = self.vmem._raw
+        size = len(raw)
         dx = abs(x1 - x0)
         dy = abs(y1 - y0)
         sx = 1 if x1 >= x0 else -1
         sy = 1 if y1 >= y0 else -1
         err = dx - dy
         x, y = x0, y0
-        with self.vmem.lock:
+        with self.vmem._lock:
             while True:
                 addr = y * pitch + x
                 if 0 <= addr < size:
-                    cell = buf[addr]
-                    self._write(cell, self._combine(rop, color, int(cell)))
+                    raw[addr] = self._combine(rop, color, raw[addr])
                 if x == x1 and y == y1:
                     break
                 e2 = 2 * err
@@ -280,32 +280,31 @@ class GPU:
 
 
 class SharedState:
-    """A thread-safe 16-trit register that acts as the atomic synchronization primitive."""
-
     def __init__(self, trits=16):
-        self.data = Trite(trits=trits)
-        self.lock = threading.Lock()
+        self._raw = RawArray('i', trits)
+        self._lock = Lock()
 
     def atomic_test_and_set(self, index, test_val=Trit.MID, set_val=Trit.HI) -> bool:
-        """Standard 'Test-and-Set' Mutex primitive. Returns True if lock acquired."""
-        with self.lock:
-            if self.data.get(index) == test_val:
-                self.data.set(index, set_val)
+        with self._lock:
+            if self._raw[index] == test_val:
+                self._raw[index] = set_val
                 return True
             return False
 
     def release(self, index, reset_val=Trit.MID):
-        with self.lock:
-            self.data.set(index, reset_val)
+        with self._lock:
+            self._raw[index] = reset_val
 
     def get_full_state(self):
-        with self.lock:
-            clone = Trite(trits=len(self.data.trits))
-            return clone.clone_from(self.data)
+        with self._lock:
+            clone = Trite(trits=len(self._raw))
+            for i in range(len(self._raw)):
+                clone.trits[i].set(self._raw[i])
+            return clone
 
 
 # =========================
-# THREAD-SAFE DISK
+# DISK (mp.Lock + pickle support for cross-process use)
 # =========================
 class Disk:
     _PLAIN_ENCODE = {-1: ord("-"), 0: ord("0"), 1: ord("+")}
@@ -316,7 +315,7 @@ class Disk:
         self.size = size
         self.trits = trits
         self.plain = plain
-        self.lock = threading.Lock()
+        self.lock = Lock()
 
         total_bytes = size * trits
         fill_byte = b"0" if plain else b"\x00"
@@ -329,6 +328,16 @@ class Disk:
                 f.seek(0, os.SEEK_END)
                 f.write(fill_byte * (total_bytes - f.tell()))
         self.file = open(path, "r+b")
+
+    def __getstate__(self):
+        # File handles can't be pickled; reopen in each child process.
+        state = self.__dict__.copy()
+        del state["file"]
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self.file = open(self.path, "r+b")
 
     def _decode_byte(self, b: int) -> int:
         if self.plain:
@@ -369,42 +378,32 @@ class InstructionSet:
     def __init__(self, **kwargs):
         self.instructions = kwargs
 
-    def add(self, opcode: str | Trite, operandslength, func):
+    def add(self, opcode: "str | Trite", operandslength, func):
         if isinstance(opcode, str):
             self.instructions[opcode] = (operandslength, func)
         else:
             self.instructions[str(opcode)] = (operandslength, func)
 
-    def get(self, opcode: str | Trite):
+    def get(self, opcode: "str | Trite"):
         entry = self.instructions.get(
             str(opcode) if isinstance(opcode, Trite) else opcode
         )
         return entry[1] if entry is not None else None
 
-    def get_opcount(self, opcode: str | Trite):
+    def get_opcount(self, opcode: "str | Trite"):
         entry = self.instructions.get(
             str(opcode) if isinstance(opcode, Trite) else opcode
         )
         return entry[0] if entry is not None else None
 
-    def instruction(self, opcode: str | Trite):
+    def instruction(self, opcode: "str | Trite"):
         def wrapper(func):
             self.add(opcode, func.__code__.co_argcount - 1, func)
             return func
-
         return wrapper
 
 
-def encode_instruction(opcode: str, operands: list) -> list[Trite]:
-    """Encodes one instruction as a stream of 8-trit words.
-
-    Layout (the "first hunk" is 2 words = 16 trits):
-        word 0: 6-trit opcode + 2-trit operand count (offset +4)
-        word 1: ref-type map, one trit per operand slot --
-                LO = register, MID = immediate, HI = reserved
-        word 2i+2, 2i+3: operand i's value as a 16-trit number, split into
-                          its low 8 trits and high 8 trits
-    """
+def encode_instruction(opcode: str, operands: list) -> "list[Trite]":
     count_field = str(Trite(trits=2).from_int(len(operands) - 4))
     header = Trite().from_str(opcode + count_field)
 
@@ -422,28 +421,169 @@ def encode_instruction(opcode: str, operands: list) -> list[Trite]:
 
 
 # =========================
-# CORE (The Thread)
+# GPU CORE (multiprocessing worker -- drains gpu_queue)
 # =========================
-class Core(threading.Thread):
+
+def _gpu_worker(vmem_raw, vmem_lock, gpu_queue, gpu_opcount):
+    """Top-level GPU worker: reconstruct vmem from shared primitives, drain queue.
+
+    Must be a top-level function (not a method) so Windows spawn can pickle it
+    by name without serialising the TernarySystem object graph.
+    """
+    vmem = VideoMemory.__new__(VideoMemory)
+    vmem._raw = vmem_raw
+    vmem._lock = vmem_lock
+    gpu = GPU(vmem)
+    while True:
+        job = gpu_queue.get()
+        if job is None:
+            gpu_queue.task_done()
+            break
+        opcode, args = job
+        try:
+            if opcode == GPU.OPCODE_FILL:
+                gpu.fill(*args)
+            elif opcode == GPU.OPCODE_BLIT:
+                gpu.blit(*args)
+            elif opcode == GPU.OPCODE_LINE:
+                gpu.line(*args[:5])
+        finally:
+            gpu_opcount.value += 1
+            gpu_queue.task_done()
+
+
+class GPUCore(Process):
+    def __init__(self, gpu_id, system):
+        # Pass only the shared primitives needed by _gpu_worker, not system
+        # itself.  Storing system would embed all other Core/GPUCore Process
+        # objects in the pickle tree, which Python 3.12 on Windows rejects.
+        super().__init__(
+            target=_gpu_worker,
+            args=(system.vmem._raw, system.vmem._lock,
+                  system.gpu_queue, system._gpu_opcount),
+            name=f"GPU-{gpu_id}",
+            daemon=True,
+        )
+        self.gpu_id = gpu_id
+
+
+# =========================
+# CPU CORE (multiprocessing -- one process per core)
+# =========================
+class Core(Process):
     def __init__(self, core_id, system, isa):
         super().__init__(name=f"Core-{core_id}", daemon=True)
         self.core_id = core_id
         self.system = system
         self.isa = isa
 
-        # Local State
-        # 16 trits so registers/PC/SP/FP can hold any address in the largest
-        # address space (vmem: 531441 cells) -- the instruction format
-        # already encodes every operand as a full 16-trit value, so this
-        # just matches what the ISA already supports.
+        # Local state -- not shared; each process owns its own registers.
         self.registers = [Trite(trits=16) for _ in range(16)]
         self.PC = Trite(trits=16)
         self.SP = Trite(trits=16)
         self.FP = Trite(trits=16)
         self.FLAGS = 0
-        self.HALTED = False
+        # mp.Event is backed by OS semaphore: shared between parent and child
+        # so stop_all() (parent) and op_halt (child) both reach the same flag.
+        self._halt = Event()
         self._jumped = False
         self._next_pc = 0
+
+        # Stash the individual shared primitives needed to reconstruct system
+        # in the child process.  __getstate__ will drop self.system (which
+        # contains other unstarted Process objects) and keep only these, which
+        # are all picklable mp primitives.
+        self._s_mem_raw    = system.mem._raw
+        self._s_mem_lock   = system.mem._lock
+        self._s_vmem_raw   = system.vmem._raw
+        self._s_vmem_lock  = system.vmem._lock
+        self._s_state_raw  = system.state._raw
+        self._s_state_lock = system.state._lock
+        self._s_disk_path  = system.disk.path
+        self._s_disk_size  = system.disk.size
+        self._s_disk_trits = system.disk.trits
+        self._s_disk_plain = system.disk.plain
+        self._s_boot_path  = system.bootsector.path
+        self._s_boot_size  = system.bootsector.size
+        self._s_boot_trits = system.bootsector.trits
+        self._s_boot_plain = system.bootsector.plain
+        self._s_gpu_queue  = system.gpu_queue
+        self._s_gpu_opc    = system._gpu_opcount
+        self._s_io_lock    = system.io_lock
+        self._s_step       = system._step_counts[core_id]
+        self._s_vbuf_alloc = system.vbuffer_alloc
+        self._s_vbuf_off   = system.vbuffer_offset
+
+    def __getstate__(self):
+        # Windows spawn pickles the entire Process object.  Drop attributes
+        # that contain other Process objects (system.cores / system.gpu_cores),
+        # which Python 3.12 cannot pickle via ForkingPickler.
+        state = self.__dict__.copy()
+        del state['system']     # rebuilt in __setstate__ from _s_* primitives
+        del state['isa']        # module-level global; not safely picklable by value
+        del state['registers']  # child starts with clean register file
+        del state['PC']
+        del state['SP']
+        del state['FP']
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        # Rebuild lightweight wrappers from the shared primitives.
+        mem = Memory.__new__(Memory)
+        mem._trit_width = 8
+        mem._raw  = self._s_mem_raw
+        mem._lock = self._s_mem_lock
+
+        vmem = VideoMemory.__new__(VideoMemory)
+        vmem._raw  = self._s_vmem_raw
+        vmem._lock = self._s_vmem_lock
+
+        state_obj = SharedState.__new__(SharedState)
+        state_obj._raw  = self._s_state_raw
+        state_obj._lock = self._s_state_lock
+
+        disk = Disk(self._s_disk_path, self._s_disk_size,
+                    trits=self._s_disk_trits, plain=self._s_disk_plain)
+        boot = Disk(self._s_boot_path, self._s_boot_size,
+                    trits=self._s_boot_trits, plain=self._s_boot_plain)
+
+        class _SysProxy:
+            pass
+        sys = _SysProxy()
+        sys.mem        = mem
+        sys.vmem       = vmem
+        sys.state      = state_obj
+        sys.disk       = disk
+        sys.bootsector = boot
+        sys.gpu_queue  = self._s_gpu_queue
+        sys.gpu        = GPU(vmem)
+        sys.io_lock    = self._s_io_lock
+        sys.io_in      = []
+        sys.io_out     = []
+        sys._step_counts = [None] * 16
+        sys._step_counts[self.core_id] = self._s_step
+        sys._gpu_opcount = self._s_gpu_opc
+        sys.vbuffer_alloc  = self._s_vbuf_alloc
+        sys.vbuffer_offset = self._s_vbuf_off
+
+        self.system = sys
+        self.isa = ternary_1   # module-level global; available after cpu.py import in child
+        self.registers = [Trite(trits=16) for _ in range(16)]
+        self.PC = Trite(trits=16)
+        self.SP = Trite(trits=16)
+        self.FP = Trite(trits=16)
+
+    @property
+    def HALTED(self):
+        return self._halt.is_set()
+
+    @HALTED.setter
+    def HALTED(self, value):
+        if value:
+            self._halt.set()
+        else:
+            self._halt.clear()
 
     def r(self, i):
         return self.registers[i]
@@ -463,11 +603,6 @@ class Core(threading.Thread):
         self._jumped = True
 
     def _push_word(self, value: int):
-        """Pushes one full 16-trit value onto the stack as two consecutive
-        8-trit memory words (low half, then high half) -- the same split
-        `encode_instruction` already uses for instruction operands -- so
-        any address or register value, not just ones under 3280, survives
-        a push/pop round trip intact."""
         full = Trite(trits=16).from_int(value)
         self.SP.from_int(int(self.SP) - 2)
         self.system.mem.set(self.SP, full[:8])
@@ -492,7 +627,7 @@ class Core(threading.Thread):
             self.FLAGS |= Flags.OVERFLOW
 
     def step(self):
-        if self.HALTED:
+        if self._halt.is_set():
             return
 
         header = self.system.mem.get(self.PC)
@@ -534,46 +669,11 @@ class Core(threading.Thread):
         else:
             self.PC.from_int(base + 2 + op_count * 2)
 
+        self.system._step_counts[self.core_id].value += 1
+
     def run(self):
-        """The main execution loop for this core."""
-        while not self.HALTED:
+        while not self._halt.is_set():
             self.step()
-
-
-# =========================
-# GPU CORE (The GPU's own thread)
-# =========================
-class GPUCore(threading.Thread):
-    """A GPU execution unit: unlike a CPU `Core`, it doesn't fetch its own
-    instruction stream -- it idles until the CPU dispatches a job via
-    GPROC, runs that one blitter operation, then goes back to idling.
-    Several of these let multiple queued jobs run concurrently, the same
-    way real GPUs spread work across many execution units rather than
-    one core doing everything serially.
-    """
-
-    def __init__(self, gpu_id, system):
-        super().__init__(name=f"GPU-{gpu_id}", daemon=True)
-        self.gpu_id = gpu_id
-        self.system = system
-
-    def run(self):
-        while True:
-            job = self.system.gpu_queue.get()
-            if job is None:  # shutdown sentinel from TernarySystem.stop_all
-                self.system.gpu_queue.task_done()
-                break
-            opcode, args = job
-            try:
-                gpu = self.system.gpu
-                if opcode == GPU.OPCODE_FILL:
-                    gpu.fill(*args)
-                elif opcode == GPU.OPCODE_BLIT:
-                    gpu.blit(*args)
-                elif opcode == GPU.OPCODE_LINE:
-                    gpu.line(*args[:5])
-            finally:
-                self.system.gpu_queue.task_done()
 
 
 # =========================
@@ -601,7 +701,7 @@ class TernarySystem:
         self.vbuffer_alloc = 640 * 480
         self.vbuffer_offset = 0
 
-        self.io_lock = threading.Lock()
+        self.io_lock = Lock()
         self.io_in = []
         self.io_out = []
 
@@ -610,14 +710,17 @@ class TernarySystem:
             self.DEFAULT_BOOTSECTOR_PATH, self.DEFAULT_BOOTSECTOR_SIZE, plain=plain
         )
 
-        self.cores = [Core(i, self, isa) for i in range(num_cores)]
+        # Shared counters readable from any process (lock=False is safe here:
+        # each core writes only its own slot; display reads are approximate).
+        self._step_counts = [Value('l', 0, lock=False) for _ in range(num_cores)]
+        self._gpu_opcount = Value('l', 0, lock=False)
 
-        # GPU: a small blitter (`self.gpu`) plus `num_graphical_cores` idle
-        # GPUCore threads that only do work when a CPU core dispatches a
-        # job via GPROC (`self.gpu_queue`). GSYNC blocks a CPU core on
-        # `gpu_queue.join()` until every dispatched job has completed.
+        # gpu_queue must exist before Core objects are built so Core.__init__
+        # can stash it as a picklable primitive for the child process.
         self.gpu = GPU(self.vmem)
-        self.gpu_queue = queue.Queue()
+        self.gpu_queue = JoinableQueue()
+
+        self.cores = [Core(i, self, isa) for i in range(num_cores)]
         self.gpu_cores = [GPUCore(i, self) for i in range(num_graphical_cores)]
 
         self._boot()
@@ -634,15 +737,23 @@ class TernarySystem:
 
     def stop_all(self):
         for core in self.cores:
-            core.HALTED = True  # type: ignore
+            core.HALTED = True
         for _ in self.gpu_cores:
-            self.gpu_queue.put(None)  # shutdown sentinel, one per GPU core
+            self.gpu_queue.put(None)  # one sentinel per GPU core
 
     def join_all(self):
+        # Ensure any running GPU cores get a shutdown sentinel so they can
+        # exit cleanly.  Extra sentinels are harmless if stop_all() was
+        # already called (dead workers don't read from the queue).
+        for gc in self.gpu_cores:
+            if gc.pid is not None and gc.is_alive():
+                self.gpu_queue.put(None)
         for core in self.cores:
-            core.join()
+            if core.pid is not None:
+                core.join()
         for gpu_core in self.gpu_cores:
-            gpu_core.join()
+            if gpu_core.pid is not None:
+                gpu_core.join()
 
 
 ternary_1 = InstructionSet()
@@ -651,7 +762,7 @@ ternary_1 = InstructionSet()
 # ---- Core Logic & Memory Instructions ---------------------------
 @ternary_1.instruction("000000")
 def op_halt(self: Core):
-    self.HALTED = True  # type: ignore
+    self.HALTED = True
 
 
 @ternary_1.instruction("00000-")
@@ -991,7 +1102,7 @@ def op_leave(self: Core):
     self.FP.from_int(self._pop_word())
 
 
-# ---- disk I/O -----------------------------------------------------------
+# ---- Disk I/O -----------------------------------------------------------
 @ternary_1.instruction("00-000")
 def op_dload(self: Core, addr, dst):
     self.r(dst).clone_from(self.system.disk.get(self.value(addr)))
@@ -1014,60 +1125,54 @@ def op_dstoreo(self: Core, base, offset, src):
     self.system.disk.set(addr, self.as_trite(src))
 
 
-# ---- vram I/O -----------------------------------------------------------
+# ---- VRAM I/O (vmem stores raw ints; get/set use int values directly) ----
 @ternary_1.instruction("00--00")
 def op_vload(self: Core, addr, dst):
-    self.r(dst).clone_from(self.system.vmem.get(self.value(addr)))
+    self.r(dst).from_int(self.system.vmem.get(self.value(addr)))
 
 
 @ternary_1.instruction("00--0-")
 def op_vstore(self: Core, addr, src):
-    self.system.vmem.set(self.value(addr), self.as_trite(src))
+    self.system.vmem.set(self.value(addr), self.value(src))
 
 
 @ternary_1.instruction("00--0+")
 def op_vloado(self: Core, base, offset, dst):
     addr = self.value(base) + self.value(offset)
-    self.r(dst).clone_from(self.system.vmem.get(addr))
+    self.r(dst).from_int(self.system.vmem.get(addr))
 
 
 @ternary_1.instruction("00---0")
 def op_vstoreo(self: Core, base, offset, src):
     addr = self.value(base) + self.value(offset)
-    self.system.vmem.set(addr, self.as_trite(src))
+    self.system.vmem.set(addr, self.value(src))
 
 
 @ternary_1.instruction("00----")
 def op_vclear(self: Core):
-    zero = Trite(trits=5)
+    raw = self.system.vmem._raw
     with self.system.vmem.lock:
-        for i in range(len(self.system.vmem.vmem)):
-            self.system.vmem.vmem[i].clone_from(zero)
+        for i in range(len(raw)):
+            raw[i] = 0
 
 
 @ternary_1.instruction("00---+")
 def op_vbuffer_fill(self: Core):
-    zero = Trite(trits=5)
+    raw = self.system.vmem._raw
     with self.system.vmem.lock:
         for i in range(
             self.system.vbuffer_offset,
             self.system.vbuffer_offset + self.system.vbuffer_alloc,
         ):
-            self.system.vmem.vmem[i].clone_from(zero)
+            raw[i] = 0
 
 
-# ---- GPU dispatch --------------------------------------------------------
+# ---- GPU Dispatch --------------------------------------------------------
 @ternary_1.instruction("0+0000")
 def op_gproc(self: Core, opcode, a, b, c, d, e, f):
-    """Dispatches one job to the GPU's own instruction set (FILL=0,
-    BLIT=1, LINE=2) instead of running it as ternary instructions, one
-    per pixel, on this core. Always takes the same 7 operands (opcode +
-    6 data slots), like a fixed-size hardware command packet; ops
-    needing fewer than 6 data args (e.g. LINE) just leave the trailing
-    ones unused. Asynchronous: the job is queued for the GPU cores and
-    this core continues immediately. Use GSYNC to wait for completion.
+    """Enqueue one GPU job (FILL / BLIT / LINE).  Asynchronous; use GSYNC to fence.
 
-        FILL: a=dst_addr, b=pitch, c=width,  d=height, e=color, f=rop
+        FILL: a=dst_addr, b=pitch, c=width, d=height, e=color, f=rop
         BLIT: a=src_addr, b=dst_addr, c=pitch, d=width, e=height, f=rop
         LINE: a=addr0, b=addr1, c=pitch, d=color, e=rop
     """
@@ -1085,51 +1190,35 @@ def op_gproc(self: Core, opcode, a, b, c, d, e, f):
 
 @ternary_1.instruction("0+000-")
 def op_gsync(self: Core):
-    """Blocks this core until every GPU job dispatched so far (by any
-    core) has finished -- the fence a CPU must wait on before reading
-    vmem results from an asynchronous GPROC."""
+    """Block until every queued GPU job has completed."""
     self.system.gpu_queue.join()
 
 
-# ---- System State & Multicore Concurrency ------------------------------
+# ---- Shared State & Multicore Concurrency ------------------------------
 @ternary_1.instruction("00--+0")
 def op_getstate(self: Core, dst):
-    """Pulls the entire 16-trit shared state register into a local register."""
     self.r(dst).clone_from(self.system.state.get_full_state())
 
 
 @ternary_1.instruction("00--+-")
 def op_acq(self: Core, lock_id):
-    """
-    ATOMIC ACQUIRE: Attempts to lock the trit at `lock_id` index in the shared state.
-    If it is already locked by another core, it rewinds the PC to spin-wait (busy loop)
-    until the lock becomes available.
-    """
     idx = self.value(lock_id)
     if not self.system.state.atomic_test_and_set(idx):
-        # The lock is taken. Rewind the Program Counter to the current instruction.
-        # This creates a "Spinlock" where the core will keep retrying this instruction.
-        self.set_pc(int(self.PC))
+        self.set_pc(int(self.PC))  # spin: rewind to this instruction
 
 
 @ternary_1.instruction("00--++")
 def op_rel(self: Core, lock_id):
-    """ATOMIC RELEASE: Unlocks the trit at `lock_id` index in the shared state."""
     idx = self.value(lock_id)
     self.system.state.release(idx)
 
 
 @ternary_1.instruction("00-+-0")
 def op_coreid(self: Core, dst):
-    """Loads the executing Core's hardware ID into the destination register."""
     self.r(dst).from_int(self.core_id)
 
 
-# Initialize a Dual-Core System
-system = TernarySystem(ternary_1, num_cores=2)
-
 if __name__ == "__main__":
-    # Start all threads
+    system = TernarySystem(ternary_1, num_cores=2)
     system.start_all()
-    # Wait for completion (if they ever halt)
     system.join_all()
