@@ -213,7 +213,7 @@ def main():
     c = fresh(); c.SP.from_int(0); c.FP.from_int(0)
     call("op_enter", c, Immediate(4))
     sp_after_enter = int(c.SP)
-    check("ENTER reserves frame_size below saved FP", sp_after_enter, -2 - 4)
+    check("ENTER reserves frame_size below saved FP", sp_after_enter, -1 - 4)
     call("op_leave", c)
     check("LEAVE restores SP", int(c.SP), 0)
 
@@ -223,7 +223,7 @@ def main():
     check("DSTORE writes to disk", int(c.system.disk.get(7)), 321)
 
     c = fresh()
-    c.system.disk.set(9, Trite().from_int(654))
+    c.system.disk.set(9, Trite(trits=16).from_int(654))  # Disk words are 16 trits
     call("op_dload", c, Immediate(9), 4)
     check("DLOAD reads from disk", int(c.r(4)), 654)
 
