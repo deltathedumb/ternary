@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Coverage test for the extended instruction set (mul..leave)."""
-from cpu import TernarySystem, ternary_1, Immediate, encode_instruction, Trite
+from cpu import TernarySystem, ternary_1, Immediate, encode_instruction, Trite, GPU
 import cpu as cpu_module
 
 failures = []
@@ -231,6 +231,61 @@ check("VLOAD reads from vram", int(c.r(5)), -9)
 c = fresh()
 call("op_coreid", c, 6)
 check("COREID loads this core's id", int(c.r(6)), c.core_id)
+
+# ---- GPU dispatch (GPROC / GSYNC) ------------------------------------------
+def fresh_gpu():
+    """Like fresh(), but also starts the GPU core threads -- GPROC only
+    queues a job, a GPUCore thread has to actually be running to drain it."""
+    system = TernarySystem(ternary_1, num_cores=1, num_graphical_cores=2)
+    for gpu_core in system.gpu_cores:
+        gpu_core.start()
+    return system.cores[0]
+
+
+c = fresh_gpu()
+call(
+    "op_gproc", c,
+    Immediate(GPU.OPCODE_FILL), Immediate(1000), Immediate(100),
+    Immediate(4), Immediate(3), Immediate(50), Immediate(GPU.ROP_COPY),
+)
+call("op_gsync", c)
+filled = [int(c.system.vmem.get(1000 + row * 100 + col)) for row in range(3) for col in range(4)]
+check("GPROC FILL writes a rect", filled, [50] * 12)
+
+call(
+    "op_gproc", c,
+    Immediate(GPU.OPCODE_BLIT), Immediate(1000), Immediate(2000), Immediate(100),
+    Immediate(4), Immediate(3), Immediate(GPU.ROP_COPY),
+)
+call("op_gsync", c)
+blitted = [int(c.system.vmem.get(2000 + row * 100 + col)) for row in range(3) for col in range(4)]
+check("GPROC BLIT copies a rect", blitted, filled)
+
+call(
+    "op_gproc", c,
+    Immediate(GPU.OPCODE_LINE), Immediate(5000), Immediate(5000 + 5 * 100 + 5),
+    Immediate(100), Immediate(99), Immediate(GPU.ROP_COPY), Immediate(0),
+)
+call("op_gsync", c)
+diag = [int(c.system.vmem.get(5000 + i * 100 + i)) for i in range(6)]
+check("GPROC LINE draws a diagonal", diag, [99] * 6)
+
+call(
+    "op_gproc", c,
+    Immediate(GPU.OPCODE_FILL), Immediate(3000), Immediate(100),
+    Immediate(1), Immediate(1), Immediate(10), Immediate(GPU.ROP_COPY),
+)
+call("op_gsync", c)
+call(
+    "op_gproc", c,
+    Immediate(GPU.OPCODE_FILL), Immediate(3000), Immediate(100),
+    Immediate(1), Immediate(1), Immediate(5), Immediate(GPU.ROP_ADD),
+)
+call("op_gsync", c)
+check("GPROC FILL with ROP_ADD accumulates", int(c.system.vmem.get(3000)), 15)
+
+c.system.stop_all()
+c.system.join_all()
 
 print()
 if failures:
