@@ -119,14 +119,19 @@ def _build_demo(num_cores):
 
 
 # ---- Stats rendering -----------------------------------------------------
+_SCROLLBAR_W = 6   # width of the right-edge scrollbar track
+
+
 def _render_stats(surface, fonts, system, fps, state):
-    """Draw the stats panel onto `surface`.  `state` is a dict that persists
-    between frames (prev counts, prev time) -- mutated in-place."""
+    """Render stats onto `surface` (may be taller than the visible window).
+    Returns the total content height so the caller can clamp scroll offset.
+    `state` is a dict persisted between frames -- mutated in-place."""
     surface.fill(BG)
     font_hd, font_sm = fonts
     lh_hd = font_hd.get_height() + 3
     lh_sm = font_sm.get_height() + 2
     x, y = 10, 8
+    text_w = STATS_W - _SCROLLBAR_W - 4   # leave room for scrollbar
 
     def line(txt, color, big=False):
         nonlocal y
@@ -140,7 +145,7 @@ def _render_stats(surface, fonts, system, fps, state):
 
     def divider():
         nonlocal y
-        pygame.draw.line(surface, DIVIDER, (4, y + 2), (STATS_W - 4, y + 2), 1)
+        pygame.draw.line(surface, DIVIDER, (4, y + 2), (text_w, y + 2), 1)
         y += 7
 
     # ── Header ──────────────────────────────────────────────────────────
@@ -210,7 +215,11 @@ def _render_stats(surface, fonts, system, fps, state):
 
     # ── Controls ────────────────────────────────────────────────────────
     gap(2)
-    line("  [ESC] / close  quit", GRAY)
+    line("  [ESC] / close   quit", GRAY)
+    line("  [scroll wheel]  scroll stats", GRAY)
+
+    gap(8)
+    return y   # total content height
 
 
 # ---- Main ----------------------------------------------------------------
@@ -229,7 +238,10 @@ def run_window():
     pygame.display.set_caption("Ternary Processor Simulator")
     screen = pygame.display.set_mode((WIN_W, WIN_H))
     video_surf = pygame.Surface((VRAM_W, VRAM_H))
-    stats_surf = pygame.Surface((STATS_W, WIN_H))
+    # Virtual stats surface: tall enough to hold content even with many cores.
+    # We blit a WIN_H-tall slice of it each frame (controlled by scroll_y).
+    _STATS_VIRTUAL_H = 2000
+    stats_virtual = pygame.Surface((STATS_W, _STATS_VIRTUAL_H))
     clock = pygame.time.Clock()
 
     # Prefer monospace; fall back to pygame default.
@@ -241,11 +253,13 @@ def run_window():
         font_sm = pygame.font.Font(None, 16)
     fonts = (font_hd, font_sm)
 
-    # Persistent state for rate calculations.
+    # Persistent state for rate calculations + scroll position.
     perf_state = {
         "prev_time": time.monotonic(),
         "prev_steps": [0] * len(system.cores),
         "prev_gpu": 0,
+        "scroll_y": 0,
+        "content_h": WIN_H,
     }
 
     # Initialise SYNC_ADDR to the start of the color range so cores have a
@@ -279,8 +293,25 @@ def run_window():
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     running = False
-                elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
-                    running = False
+                elif event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_ESCAPE:
+                        running = False
+                    elif event.key in (pygame.K_DOWN, pygame.K_j):
+                        perf_state["scroll_y"] += 20
+                    elif event.key in (pygame.K_UP, pygame.K_k):
+                        perf_state["scroll_y"] -= 20
+                    elif event.key == pygame.K_PAGEDOWN:
+                        perf_state["scroll_y"] += WIN_H // 2
+                    elif event.key == pygame.K_PAGEUP:
+                        perf_state["scroll_y"] -= WIN_H // 2
+                    elif event.key == pygame.K_HOME:
+                        perf_state["scroll_y"] = 0
+                    elif event.key == pygame.K_END:
+                        perf_state["scroll_y"] = perf_state["content_h"]
+                elif event.type == pygame.MOUSEWHEEL:
+                    mx, _ = pygame.mouse.get_pos()
+                    if mx >= VIDEO_W:   # mouse is over the stats panel
+                        perf_state["scroll_y"] -= event.y * 20
 
             # ── Video panel ──────────────────────────────────────────────
             raw = system.vmem._raw
@@ -310,8 +341,24 @@ def run_window():
                 fps = 1.0 / dt_fps
             t_last_fps = now
 
-            _render_stats(stats_surf, fonts, system, fps, perf_state)
-            screen.blit(stats_surf, (VIDEO_W, 0))
+            content_h = _render_stats(stats_virtual, fonts, system, fps, perf_state)
+            perf_state["content_h"] = content_h
+
+            # Clamp scroll so we never show empty space below content.
+            max_scroll = max(0, content_h - WIN_H)
+            perf_state["scroll_y"] = max(0, min(perf_state["scroll_y"], max_scroll))
+            scroll_y = perf_state["scroll_y"]
+
+            # Blit the visible slice of the virtual surface.
+            screen.blit(stats_virtual, (VIDEO_W, 0), (0, scroll_y, STATS_W, WIN_H))
+
+            # Scrollbar (only when content exceeds the panel height).
+            if content_h > WIN_H:
+                sb_x = VIDEO_W + STATS_W - _SCROLLBAR_W
+                pygame.draw.rect(screen, DIVIDER, (sb_x, 0, _SCROLLBAR_W, WIN_H))
+                thumb_h = max(20, int(WIN_H * WIN_H / content_h))
+                thumb_y = int(scroll_y / max_scroll * (WIN_H - thumb_h))
+                pygame.draw.rect(screen, GRAY, (sb_x, thumb_y, _SCROLLBAR_W, thumb_h), border_radius=3)
 
             # Panel border
             pygame.draw.line(screen, (55, 58, 72), (VIDEO_W, 0), (VIDEO_W, WIN_H), 2)
