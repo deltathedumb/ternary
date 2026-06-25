@@ -1,4 +1,5 @@
 import os
+from types import SimpleNamespace
 from multiprocessing import Process, Event, Lock, JoinableQueue, RawArray, Value
 
 
@@ -143,7 +144,7 @@ class Flags:
 class Memory:
     def __init__(self, size, trit_width=8):
         self._trit_width = trit_width
-        self._raw = RawArray('i', size)
+        self._raw = RawArray("i", size)
         self._lock = Lock()
 
     @property
@@ -151,7 +152,7 @@ class Memory:
         # backward compat: len(system.mem.mem) still works
         return self._raw
 
-    def get(self, addr) -> 'Trite':
+    def get(self, addr) -> "Trite":
         with self._lock:
             val = self._raw[int(addr)]
         return Trite(trits=self._trit_width).from_int(val)
@@ -170,7 +171,7 @@ class Memory:
 # =========================
 class VideoMemory:
     def __init__(self, size):
-        self._raw = RawArray('i', size)
+        self._raw = RawArray("i", size)
         self._lock = Lock()
 
     def get(self, addr) -> int:
@@ -248,7 +249,7 @@ class GPU:
                 if srow < 0 or srow + width > size or drow < 0 or drow + width > size:
                     continue
                 # Snapshot source row before writing to handle src/dst overlap.
-                src_vals = list(raw[srow:srow + width])
+                src_vals = list(raw[srow : srow + width])
                 for col in range(width):
                     raw[drow + col] = self._combine(rop, src_vals[col], raw[drow + col])
 
@@ -281,7 +282,7 @@ class GPU:
 
 class SharedState:
     def __init__(self, trits=16):
-        self._raw = RawArray('i', trits)
+        self._raw = RawArray("i", trits)
         self._lock = Lock()
 
     def atomic_test_and_set(self, index, test_val=Trit.MID, set_val=Trit.HI) -> bool:
@@ -400,6 +401,7 @@ class InstructionSet:
         def wrapper(func):
             self.add(opcode, func.__code__.co_argcount - 1, func)
             return func
+
         return wrapper
 
 
@@ -423,6 +425,7 @@ def encode_instruction(opcode: str, operands: list) -> "list[Trite]":
 # =========================
 # GPU CORE (multiprocessing worker -- drains gpu_queue)
 # =========================
+
 
 def _gpu_worker(vmem_raw, vmem_lock, gpu_queue, gpu_opcount):
     """Top-level GPU worker: reconstruct vmem from shared primitives, drain queue.
@@ -459,8 +462,12 @@ class GPUCore(Process):
         # objects in the pickle tree, which Python 3.12 on Windows rejects.
         super().__init__(
             target=_gpu_worker,
-            args=(system.vmem._raw, system.vmem._lock,
-                  system.gpu_queue, system._gpu_opcount),
+            args=(
+                system.vmem._raw,
+                system.vmem._lock,
+                system.gpu_queue,
+                system._gpu_opcount,
+            ),
             name=f"GPU-{gpu_id}",
             daemon=True,
         )
@@ -482,6 +489,7 @@ class Core(Process):
         self.PC = Trite(trits=16)
         self.SP = Trite(trits=16)
         self.FP = Trite(trits=16)
+        self.PSR = Trite(trits=16)  # power state register
         self.FLAGS = 0
         # mp.Event is backed by OS semaphore: shared between parent and child
         # so stop_all() (parent) and op_halt (child) both reach the same flag.
@@ -493,38 +501,40 @@ class Core(Process):
         # in the child process.  __getstate__ will drop self.system (which
         # contains other unstarted Process objects) and keep only these, which
         # are all picklable mp primitives.
-        self._s_mem_raw    = system.mem._raw
-        self._s_mem_lock   = system.mem._lock
-        self._s_vmem_raw   = system.vmem._raw
-        self._s_vmem_lock  = system.vmem._lock
-        self._s_state_raw  = system.state._raw
+        self._s_mem_raw = system.mem._raw
+        self._s_mem_lock = system.mem._lock
+        self._s_vmem_raw = system.vmem._raw
+        self._s_vmem_lock = system.vmem._lock
+        self._s_state_raw = system.state._raw
         self._s_state_lock = system.state._lock
-        self._s_disk_path  = system.disk.path
-        self._s_disk_size  = system.disk.size
+        self._s_disk_path = system.disk.path
+        self._s_disk_size = system.disk.size
         self._s_disk_trits = system.disk.trits
         self._s_disk_plain = system.disk.plain
-        self._s_boot_path  = system.bootsector.path
-        self._s_boot_size  = system.bootsector.size
+        self._s_boot_path = system.bootsector.path
+        self._s_boot_size = system.bootsector.size
         self._s_boot_trits = system.bootsector.trits
         self._s_boot_plain = system.bootsector.plain
-        self._s_gpu_queue  = system.gpu_queue
-        self._s_gpu_opc    = system._gpu_opcount
-        self._s_io_lock    = system.io_lock
-        self._s_step       = system._step_counts[core_id]
+        self._s_gpu_queue = system.gpu_queue
+        self._s_gpu_opc = system._gpu_opcount
+        self._s_io_lock = system.io_lock
+        self._s_step = system._step_counts[core_id]
         self._s_vbuf_alloc = system.vbuffer_alloc
-        self._s_vbuf_off   = system.vbuffer_offset
+        self._s_vbuf_off = system.vbuffer_offset
+        self._s_num_cores = system.num_cores
+        self._s_num_gcores = system.num_graphical_cores
 
     def __getstate__(self):
         # Windows spawn pickles the entire Process object.  Drop attributes
         # that contain other Process objects (system.cores / system.gpu_cores),
         # which Python 3.12 cannot pickle via ForkingPickler.
         state = self.__dict__.copy()
-        del state['system']     # rebuilt in __setstate__ from _s_* primitives
-        del state['isa']        # module-level global; not safely picklable by value
-        del state['registers']  # child starts with clean register file
-        del state['PC']
-        del state['SP']
-        del state['FP']
+        del state["system"]  # rebuilt in __setstate__ from _s_* primitives
+        del state["isa"]  # module-level global; not safely picklable by value
+        del state["registers"]  # child starts with clean register file
+        del state["PC"]
+        del state["SP"]
+        del state["FP"]
         return state
 
     def __setstate__(self, state):
@@ -532,43 +542,55 @@ class Core(Process):
         # Rebuild lightweight wrappers from the shared primitives.
         mem = Memory.__new__(Memory)
         mem._trit_width = 8
-        mem._raw  = self._s_mem_raw
+        mem._raw = self._s_mem_raw
         mem._lock = self._s_mem_lock
 
         vmem = VideoMemory.__new__(VideoMemory)
-        vmem._raw  = self._s_vmem_raw
+        vmem._raw = self._s_vmem_raw
         vmem._lock = self._s_vmem_lock
 
         state_obj = SharedState.__new__(SharedState)
-        state_obj._raw  = self._s_state_raw
+        state_obj._raw = self._s_state_raw
         state_obj._lock = self._s_state_lock
 
-        disk = Disk(self._s_disk_path, self._s_disk_size,
-                    trits=self._s_disk_trits, plain=self._s_disk_plain)
-        boot = Disk(self._s_boot_path, self._s_boot_size,
-                    trits=self._s_boot_trits, plain=self._s_boot_plain)
+        disk = Disk(
+            self._s_disk_path,
+            self._s_disk_size,
+            trits=self._s_disk_trits,
+            plain=self._s_disk_plain,
+        )
+        boot = Disk(
+            self._s_boot_path,
+            self._s_boot_size,
+            trits=self._s_boot_trits,
+            plain=self._s_boot_plain,
+        )
 
-        class _SysProxy:
-            pass
-        sys = _SysProxy()
-        sys.mem        = mem
-        sys.vmem       = vmem
-        sys.state      = state_obj
-        sys.disk       = disk
-        sys.bootsector = boot
-        sys.gpu_queue  = self._s_gpu_queue
-        sys.gpu        = GPU(vmem)
-        sys.io_lock    = self._s_io_lock
-        sys.io_in      = []
-        sys.io_out     = []
-        sys._step_counts = [None] * 16
-        sys._step_counts[self.core_id] = self._s_step
-        sys._gpu_opcount = self._s_gpu_opc
-        sys.vbuffer_alloc  = self._s_vbuf_alloc
-        sys.vbuffer_offset = self._s_vbuf_off
+        step_counts = [None] * 16
+        step_counts[self.core_id] = self._s_step
+        sys = SimpleNamespace(
+            mem=mem,
+            vmem=vmem,
+            state=state_obj,
+            disk=disk,
+            bootsector=boot,
+            gpu_queue=self._s_gpu_queue,
+            gpu=GPU(vmem),
+            io_lock=self._s_io_lock,
+            io_in=[],
+            io_out=[],
+            _step_counts=step_counts,
+            _gpu_opcount=self._s_gpu_opc,
+            vbuffer_alloc=self._s_vbuf_alloc,
+            vbuffer_offset=self._s_vbuf_off,
+            num_cores=self._s_num_cores,
+            num_graphical_cores=self._s_num_gcores,
+        )
 
         self.system = sys
-        self.isa = ternary_1   # module-level global; available after cpu.py import in child
+        self.isa = (
+            ternary_1  # module-level global; available after cpu.py import in child
+        )
         self.registers = [Trite(trits=16) for _ in range(16)]
         self.PC = Trite(trits=16)
         self.SP = Trite(trits=16)
@@ -628,6 +650,15 @@ class Core(Process):
 
     def step(self):
         if self._halt.is_set():
+            return
+
+        psr = int(self.PSR)
+        if psr == 3:    # trit[1]=+1 → restart
+            self.system.stop_all()
+            self.system.start_all()
+            return
+        elif psr == 1:  # trit[0]=+1 → shutdown
+            self.system.stop_all()
             return
 
         header = self.system.mem.get(self.PC)
@@ -694,6 +725,9 @@ class TernarySystem:
         disk_size=DEFAULT_DISK_SIZE,
         plain=False,
     ):
+        self.num_cores = num_cores
+        self.num_graphical_cores = num_graphical_cores
+
         self.mem = Memory(6561)
         self.vmem = VideoMemory(640 * 480 + 6561)
         self.state = SharedState(16)
@@ -712,8 +746,8 @@ class TernarySystem:
 
         # Shared counters readable from any process (lock=False is safe here:
         # each core writes only its own slot; display reads are approximate).
-        self._step_counts = [Value('l', 0, lock=False) for _ in range(num_cores)]
-        self._gpu_opcount = Value('l', 0, lock=False)
+        self._step_counts = [Value("l", 0, lock=False) for _ in range(num_cores)]
+        self._gpu_opcount = Value("l", 0, lock=False)
 
         # gpu_queue must exist before Core objects are built so Core.__init__
         # can stash it as a picklable primitive for the child process.
@@ -1172,9 +1206,9 @@ def op_vbuffer_fill(self: Core):
 def op_gproc(self: Core, opcode, a, b, c, d, e, f):
     """Enqueue one GPU job (FILL / BLIT / LINE).  Asynchronous; use GSYNC to fence.
 
-        FILL: a=dst_addr, b=pitch, c=width, d=height, e=color, f=rop
-        BLIT: a=src_addr, b=dst_addr, c=pitch, d=width, e=height, f=rop
-        LINE: a=addr0, b=addr1, c=pitch, d=color, e=rop
+    FILL: a=dst_addr, b=pitch, c=width, d=height, e=color, f=rop
+    BLIT: a=src_addr, b=dst_addr, c=pitch, d=width, e=height, f=rop
+    LINE: a=addr0, b=addr1, c=pitch, d=color, e=rop
     """
     op = self.value(opcode)
     args = (
@@ -1213,9 +1247,21 @@ def op_rel(self: Core, lock_id):
     self.system.state.release(idx)
 
 
-@ternary_1.instruction("00-+-0")
+@ternary_1.instruction("00-+++")
 def op_coreid(self: Core, dst):
     self.r(dst).from_int(self.core_id)
+
+
+@ternary_1.instruction("00-+-+")
+def op_numcores(self: Core, dst):
+    """Loads the number of hardware cores into the destination register."""
+    self.r(dst).from_int(self.system.num_cores)
+
+
+@ternary_1.instruction("00-+-0")
+def op_numgcores(self: Core, dst):
+    """Loads the number of graphical (GPU) cores into the destination register."""
+    self.r(dst).from_int(self.system.num_graphical_cores)
 
 
 if __name__ == "__main__":
