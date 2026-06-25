@@ -142,7 +142,7 @@ class Flags:
 # MEMORY (raw int array, shared across processes via RawArray)
 # =========================
 class Memory:
-    def __init__(self, size, trit_width=8):
+    def __init__(self, size, trit_width=16):
         self._trit_width = trit_width
         self._raw = RawArray("i", size)
         self._lock = Lock()
@@ -311,7 +311,7 @@ class Disk:
     _PLAIN_ENCODE = {-1: ord("-"), 0: ord("0"), 1: ord("+")}
     _PLAIN_DECODE = {ord("-"): -1, ord("0"): 0, ord("+"): 1}
 
-    def __init__(self, path: str, size: int, trits: int = 8, plain: bool = False):
+    def __init__(self, path: str, size: int, trits: int = 16, plain: bool = False):
         self.path = path
         self.size = size
         self.trits = trits
@@ -406,19 +406,22 @@ class InstructionSet:
 
 
 def encode_instruction(opcode: str, operands: list) -> "list[Trite]":
+    """One 16-trit header word (6-trit opcode + 2-trit count field + an
+    8-trit reftype map, one trit per operand slot -- MID=immediate,
+    LO=register, matching up to the ISA's 8-operand cap) followed by one
+    full 16-trit word per operand. Memory words are 16 trits wide, so
+    every operand value (already <= a 16-trit range) fits in exactly one
+    word; no more splitting a value across a low/high word pair."""
     count_field = str(Trite(trits=2).from_int(len(operands) - 4))
-    header = Trite().from_str(opcode + count_field)
+    reftype_field = "".join(
+        "0" if isinstance(op, Immediate) else "-" for op in operands
+    ).ljust(8, "0")
+    header = Trite(trits=16).from_str(opcode + count_field + reftype_field)
 
-    reftype = Trite()
-    for i, op in enumerate(operands):
-        reftype.trits[i].set(Trit.MID if isinstance(op, Immediate) else Trit.LO)
-
-    words = [header, reftype]
+    words = [header]
     for op in operands:
         value = op.value if isinstance(op, Immediate) else op
-        full = Trite(trits=16).from_int(value)
-        words.append(full[:8])
-        words.append(full[8:16])
+        words.append(Trite(trits=16).from_int(value))
     return words
 
 
@@ -541,7 +544,7 @@ class Core(Process):
         self.__dict__.update(state)
         # Rebuild lightweight wrappers from the shared primitives.
         mem = Memory.__new__(Memory)
-        mem._trit_width = 8
+        mem._trit_width = 16
         mem._raw = self._s_mem_raw
         mem._lock = self._s_mem_lock
 
@@ -625,16 +628,14 @@ class Core(Process):
         self._jumped = True
 
     def _push_word(self, value: int):
-        full = Trite(trits=16).from_int(value)
-        self.SP.from_int(int(self.SP) - 2)
-        self.system.mem.set(self.SP, full[:8])
-        self.system.mem.set(int(self.SP) + 1, full[8:16])
+        # Memory words are now 16 trits -- the same width as a register --
+        # so a stack slot is exactly one word, no more low/high split.
+        self.SP.from_int(int(self.SP) - 1)
+        self.system.mem.set(self.SP, Trite(trits=16).from_int(value))
 
     def _pop_word(self) -> int:
-        lo = self.system.mem.get(self.SP)
-        hi = self.system.mem.get(int(self.SP) + 1)
-        value = int(lo) + int(hi) * (3**8)
-        self.SP.from_int(int(self.SP) + 2)
+        value = int(self.system.mem.get(self.SP))
+        self.SP.from_int(int(self.SP) + 1)
         return value
 
     def _set_flags(self, result, carry=False, overflow=False):
@@ -676,14 +677,12 @@ class Core(Process):
             raise Exception(f"Operand count mismatch for {opcode_str}")
 
         base = int(self.PC)
-        reftype = self.system.mem.get(base + 1)
+        reftype = header[8:16]  # same word as the opcode/count -- no separate fetch
         operands = []
 
         for i in range(op_count):
-            word_addr = base + 2 + i * 2
-            lo = self.system.mem.get(word_addr)
-            hi = self.system.mem.get(word_addr + 1)
-            value = int(lo) + int(hi) * (3**8)
+            word = self.system.mem.get(base + 1 + i)
+            value = int(word)
             tag = reftype.trits[i].get()
             if tag == Trit.MID:
                 operands.append(Immediate(value))
@@ -692,13 +691,13 @@ class Core(Process):
 
         func = self.isa.get(opcode_str)
         if func is not None:
-            self._next_pc = base + 2 + op_count * 2
+            self._next_pc = base + 1 + op_count
             self._jumped = False
             func(self, *operands)
             if not self._jumped:
                 self.PC.from_int(self._next_pc)
         else:
-            self.PC.from_int(base + 2 + op_count * 2)
+            self.PC.from_int(base + 1 + op_count)
 
         self.system._step_counts[self.core_id].value += 1
 

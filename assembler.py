@@ -139,7 +139,7 @@ def assemble(source: str) -> dict[int, Trite]:
                 raise AssemblerError(f"line {lineno}: unknown mnemonic {mnemonic!r}")
             opcode_str, op_count = MNEMONICS[mnemonic]
             parsed_lines.append((lineno, mnemonic, opcode_str, operand_tokens))
-            addr += 2 + op_count * 2
+            addr += 1 + op_count  # 1 header word + 1 word/operand (16-trit words)
 
     # ==========================================
     # PASS 2: Encode machine code at exact addresses
@@ -155,17 +155,20 @@ def assemble(source: str) -> dict[int, Trite]:
 
             if mnemonic == "DAT":
                 for tok in operand_tokens:
-                    # Support raw ternary strings (e.g., +0-0+0-0)
-                    if all(c in "+0-" for c in tok) and len(tok) <= 8:
-                        memory_map[current_addr] = Trite().from_str(tok.rjust(8, "0"))
+                    # Support raw ternary strings (e.g., +0-0+0-0). Trit 0 is
+                    # the least-significant digit (Trite's string convention
+                    # is little-endian), so padding to the target width must
+                    # go on the right to preserve the literal's value.
+                    if all(c in "+0-" for c in tok) and len(tok) <= 16:
+                        memory_map[current_addr] = Trite(trits=16).from_str(tok.ljust(16, "0"))
                     else:
                         val = _parse_operand(tok, symbols)
                         int_val = val.value if isinstance(val, Immediate) else val
-                        memory_map[current_addr] = Trite().from_int(int_val)
+                        memory_map[current_addr] = Trite(trits=16).from_int(int_val)
                     current_addr += 1
             else:
                 op_count = len(operand_tokens)
-                next_pc = current_addr + 2 + op_count * 2
+                next_pc = current_addr + 1 + op_count  # 1 header word + 1 word/operand
                 operands = []
 
                 for tok in operand_tokens:
@@ -213,7 +216,7 @@ _PLAIN_ENCODE = {-1: ord("-"), 0: ord("0"), 1: ord("+")}
 
 def assemble_to_raw_disk(source: str, size: int, plain: bool = False) -> bytes:
     """Assembles `source` and renders it as a raw virtual disk image: `size`
-    trites (8-trit words), each word 8 bytes, in the exact on-disk encoding
+    trites (16-trit words), each word 16 bytes, in the exact on-disk encoding
     `Disk.get`/`Disk.set` (cpu.py) read and write. Addresses the program
     doesn't touch are filled with the same byte a freshly created `Disk`
     starts with, so the image is indistinguishable from one `TernarySystem`
@@ -228,11 +231,12 @@ def assemble_to_raw_disk(source: str, size: int, plain: bool = False) -> bytes:
                 f"requested disk size of {size} trites"
             )
 
+    WORD_TRITS = 16
     fill_byte = ord("0") if plain else 0x00
-    image = bytearray([fill_byte] * (size * 8))
+    image = bytearray([fill_byte] * (size * WORD_TRITS))
     for addr, word in memory_map.items():
-        offset = addr * 8
-        for i in range(8):
+        offset = addr * WORD_TRITS
+        for i in range(WORD_TRITS):
             value = word.get(i)
             image[offset + i] = _PLAIN_ENCODE[value] if plain else value + 1
     return bytes(image)
