@@ -31,7 +31,7 @@ if str(_HERE) not in sys.path:
 from cpu import TernarySystem, ternary_1
 from text_terminal import TextTerminal
 
-# ── Video layout (must match TextTerminal constants in cpu.py) ─────────────────
+# ── Video layout (must match TextTerminal constants) ──────────────────────────
 VRAM_W  = 243
 VRAM_H  = 192
 SCALE   = 2
@@ -141,9 +141,6 @@ def run_gui(build_dir: pathlib.Path) -> None:
     screen = pygame.display.set_mode((WIN_W, WIN_H))
     clock  = pygame.time.Clock()
 
-    # Build font BEFORE creating TernarySystem so child process gets it.
-    font_data = _build_font()
-
     try:
         font_hd = pygame.font.SysFont("Courier New", 13, bold=True)
         font_sm = pygame.font.SysFont("Courier New", 12)
@@ -164,7 +161,7 @@ def run_gui(build_dir: pathlib.Path) -> None:
         disk_path=str(disk_path),
         disk_size=19683,
     )
-    terminal = TextTerminal(system.vmem, font_data)
+    terminal = TextTerminal(system.vmem)
     boot_words = load_tern_words(boot_path)
     for i, w in enumerate(boot_words):
         system.mem.set(i, w)
