@@ -45,10 +45,7 @@ KERNEL_DISK_SECTOR  = 1
 KERNEL_DISK_SECTORS = 10
 
 SHELL_DISK_SECTOR   = 11
-SHELL_DISK_SECTORS  = 10
-
-HELLO_DISK_SECTOR   = 21
-HELLO_DISK_SECTORS  = 5
+SHELL_DISK_SECTORS  = 30
 
 
 def name_ints(s: str) -> list[int]:
@@ -72,15 +69,13 @@ def pad_to_sectors(words: list[int], n_sectors: int) -> list[int]:
     return words + [0] * (target - len(words))
 
 
-def build_disk(kernel_words, shell_words, hello_words) -> list[int]:
+def build_disk(kernel_words, shell_words) -> list[int]:
     disk = [0] * DISK_CELLS
 
     # ── Directory (sector 0) ──────────────────────────────────────────────────
-    # Each entry: 6 name cells + start_sector + num_sectors
     entries = [
         ("kernel", KERNEL_DISK_SECTOR, KERNEL_DISK_SECTORS),
         ("shell\x00",  SHELL_DISK_SECTOR,   SHELL_DISK_SECTORS),
-        ("hello\x00",  HELLO_DISK_SECTOR,   HELLO_DISK_SECTORS),
     ]
     dir_base = DIR_SECTOR * SECTOR_SIZE
     for idx, (name, start, size) in enumerate(entries):
@@ -96,16 +91,10 @@ def build_disk(kernel_words, shell_words, hello_words) -> list[int]:
     for i, w in enumerate(kwords):
         disk[off + i] = w
 
-    # ── Shell (sectors 11-15) ─────────────────────────────────────────────────
+    # ── Shell (sectors 11-40) ─────────────────────────────────────────────────
     swords = pad_to_sectors(shell_words, SHELL_DISK_SECTORS)
     off = SHELL_DISK_SECTOR * SECTOR_SIZE
     for i, w in enumerate(swords):
-        disk[off + i] = w
-
-    # ── Hello (sectors 16-20) ─────────────────────────────────────────────────
-    hwords = pad_to_sectors(hello_words, HELLO_DISK_SECTORS)
-    off = HELLO_DISK_SECTOR * SECTOR_SIZE
-    for i, w in enumerate(hwords):
         disk[off + i] = w
 
     return disk

@@ -522,6 +522,7 @@ class Core(Process):
         self._s_gpu_opc = system._gpu_opcount
         self._s_io_lock = system.io_lock
         self._s_io_out_q = system._io_out_q
+        self._s_io_in_q  = system._io_in_q
         self._s_step = system._step_counts[core_id]
         self._s_vbuf_alloc = system.vbuffer_alloc
         self._s_vbuf_off = system.vbuffer_offset
@@ -584,6 +585,7 @@ class Core(Process):
             io_in=[],
             io_out=[],
             _io_out_q=self._s_io_out_q,
+            _io_in_q=self._s_io_in_q,
             _step_counts=step_counts,
             _gpu_opcount=self._s_gpu_opc,
             vbuffer_alloc=self._s_vbuf_alloc,
@@ -740,6 +742,7 @@ class TernarySystem:
         self.io_in = []
         self.io_out = []
         self._io_out_q = Queue()   # cross-process; drained by drain_io_out()
+        self._io_in_q  = Queue()   # cross-process; filled by push_input()
 
         self.disk = Disk(disk_path, disk_size, plain=plain)
         self.bootsector = Disk(
@@ -788,6 +791,10 @@ class TernarySystem:
                 break
         self.io_out.extend(results)
         return results
+
+    def push_input(self, char_int: int) -> None:
+        """Send a character code to the CPU (consumed by IN instructions)."""
+        self._io_in_q.put(char_int)
 
     def join_all(self):
         # Ensure any running GPU cores get a shutdown sentinel so they can
@@ -1136,8 +1143,14 @@ def op_out(self: Core, port, src):
 
 @ternary_1.instruction("00++-+")
 def op_in(self: Core, port, dst):
-    with self.system.io_lock:
-        value = self.system.io_in.pop(0) if self.system.io_in else 0
+    # Block until a character arrives; poll with timeout so halt is honoured.
+    value = 0
+    while not self._halt.is_set():
+        try:
+            value = self.system._io_in_q.get(timeout=0.05)
+            break
+        except Exception:
+            pass
     self.r(dst).from_int(value)
 
 

@@ -40,10 +40,7 @@ KERNEL_DISK_SECTOR  = 1    # kernel starts here
 KERNEL_DISK_SECTORS = 10   # 10 sectors (810 cells)
 
 SHELL_DISK_SECTOR   = 11   # shell starts here
-SHELL_DISK_SECTORS  = 10   # 10 sectors (810 cells)
-
-HELLO_DISK_SECTOR   = 21   # hello program starts here
-HELLO_DISK_SECTORS  = 5    # 5 sectors (405 cells)
+SHELL_DISK_SECTORS  = 30   # 30 sectors (2430 cells)
 
 # ── RAM layout ────────────────────────────────────────────────────────────────
 BOOTSECTOR_RAM   = 0       # bootsector loaded by _boot() into RAM[0]

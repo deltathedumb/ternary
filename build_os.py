@@ -37,9 +37,8 @@ from asmpython._backends.ternary import encoder as E
 from os_constants import (
     KERNEL_RAM, KERNEL_DISK_SECTOR, KERNEL_DISK_SECTORS,
     SHELL_RAM, SHELL_DISK_SECTOR, SHELL_DISK_SECTORS,
-    HELLO_DISK_SECTOR, HELLO_DISK_SECTORS,
-    PROG_RAM, SECTOR_SIZE,
-    KERNEL_FRAME, SHELL_FRAME, PROG_FRAME,
+    SECTOR_SIZE,
+    KERNEL_FRAME, SHELL_FRAME,
 )
 
 
@@ -126,23 +125,19 @@ def main():
                                   load_addr=KERNEL_RAM, frame_addr=KERNEL_FRAME, lib=False)
     shell_bytes  = compile_source(src_dir / "shell.py",
                                   load_addr=SHELL_RAM,  frame_addr=SHELL_FRAME, lib=True)
-    hello_bytes  = compile_source(src_dir / "hello.py",
-                                  load_addr=PROG_RAM,   frame_addr=PROG_FRAME,  lib=True)
     boot_bytes   = build_bootsector()
 
     # Write individual .tern files
     (out_dir / "kernel.tern").write_bytes(kernel_bytes)
     (out_dir / "shell.tern").write_bytes(shell_bytes)
-    (out_dir / "hello.tern").write_bytes(hello_bytes)
     (out_dir / "bootsector.tern").write_bytes(boot_bytes)
 
     # Build disk image via mkfs logic (imported inline to avoid subprocess)
     import mkfs
     kernel_words = list(struct.unpack_from(f"<{len(kernel_bytes)//4}i", kernel_bytes))
     shell_words  = list(struct.unpack_from(f"<{len(shell_bytes)//4}i",  shell_bytes))
-    hello_words  = list(struct.unpack_from(f"<{len(hello_bytes)//4}i",  hello_bytes))
 
-    disk_words = mkfs.build_disk(kernel_words, shell_words, hello_words)
+    disk_words = mkfs.build_disk(kernel_words, shell_words)
     disk_path = out_dir / "ternary.disk"
     mkfs.write_disk(disk_path, disk_words)
 
