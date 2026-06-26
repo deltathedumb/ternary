@@ -2,10 +2,10 @@
 os_gui.py — GUI OS runner for the ternary computer.
 
 The ternary CPU renders text directly into the shared video memory (vmem)
-via the TextTerminal hardware class in cpu.py.  This window just blits
-the raw framebuffer — the display is driven by the simulated system.
+via TextTerminal (text_terminal.py).  This window just blits the raw
+framebuffer — the display is driven by the simulated system.
 
-Layout  (matches display.py):
+Layout:
   Left  486×384   vmem framebuffer scaled 2× from 243×192
   Right 264×384   live stats panel
 
@@ -18,7 +18,6 @@ import pathlib
 import struct
 import sys
 import time
-from multiprocessing import Array as MPArray
 
 import pygame
 
@@ -53,31 +52,6 @@ RED     = (255, 70,  70)
 WHITE   = (230, 230, 235)
 GRAY    = (130, 135, 148)
 DIVIDER = (45,  48,  62)
-
-
-# ── Font generation ───────────────────────────────────────────────────────────
-
-def _build_font() -> MPArray:
-    """Rasterise ASCII 0–127 into 8×8 bitmap glyphs using pygame.
-    Returns a multiprocessing.Array('B', 128*8) — one byte per glyph row."""
-    try:
-        font = pygame.font.SysFont("Courier New", 11, bold=True)
-    except Exception:
-        font = pygame.font.Font(None, 11)
-
-    data = MPArray('B', 128 * 8)
-    for ch in range(128):
-        c = chr(ch) if 32 <= ch < 127 else ' '
-        glyph = font.render(c, False, (255, 255, 255), (0, 0, 0))
-        glyph = pygame.transform.scale(glyph, (8, 8))
-        arr   = pygame.surfarray.array2d(glyph)   # shape (width=8, height=8)
-        for row in range(8):
-            bits = 0
-            for col in range(8):
-                if arr[col, row] != 0:
-                    bits |= (1 << (7 - col))
-            data[ch * 8 + row] = bits
-    return data
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
