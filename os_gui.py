@@ -160,6 +160,7 @@ def run_gui(build_dir: pathlib.Path) -> None:
         num_graphical_cores=0,
         disk_path=str(disk_path),
         disk_size=19683,
+        ram_size=43046721,
     )
     terminal = TextTerminal(system.vmem)
     boot_words = load_tern_words(boot_path)

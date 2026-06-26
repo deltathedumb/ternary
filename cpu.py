@@ -730,11 +730,12 @@ class TernarySystem:
         disk_path=DEFAULT_DISK_PATH,
         disk_size=DEFAULT_DISK_SIZE,
         plain=False,
+        ram_size=6561,
     ):
         self.num_cores = num_cores
         self.num_graphical_cores = num_graphical_cores
 
-        self.mem = Memory(6561)
+        self.mem = Memory(ram_size)
         self.vmem = VideoMemory(640 * 480 + 6561)
         self.state = SharedState(16)
 

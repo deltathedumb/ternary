@@ -68,8 +68,8 @@ def main() -> int:
 
     start_sec = mem_load(entry_base + 6)
     num_secs  = mem_load(entry_base + 7)
-    load_sectors(1200, start_sec, num_secs)
+    load_sectors(10000, start_sec, num_secs)
 
-    call_addr(1200)
+    call_addr(10000)
 
     return 0

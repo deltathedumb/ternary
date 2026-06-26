@@ -40,20 +40,20 @@ KERNEL_DISK_SECTOR  = 1    # kernel starts here
 KERNEL_DISK_SECTORS = 10   # 10 sectors (810 cells)
 
 SHELL_DISK_SECTOR   = 11   # shell starts here
-SHELL_DISK_SECTORS  = 30   # 30 sectors (2430 cells)
+SHELL_DISK_SECTORS  = 130  # 130 sectors (10530 cells); user files start at sector 141
 
 # ── RAM layout ────────────────────────────────────────────────────────────────
 BOOTSECTOR_RAM   = 0       # bootsector loaded by _boot() into RAM[0]
 
 KERNEL_RAM       = 300     # kernel loaded at this RAM address
-SHELL_RAM        = 1200    # shell (user prog slot 1) loaded here
+SHELL_RAM        = 10000   # shell loaded here (code ends ~14308, safe from cmd buf)
 PROG_RAM         = 2000    # general user program area
 
 KERNEL_SCRATCH   = 2500    # kernel scratch space (dir reads, temp)
 
 # ── Static frame bases (alloca slots for compiled programs) ──────────────────
 KERNEL_FRAME     = 4000    # kernel alloca frames
-SHELL_FRAME      = 4200    # shell alloca frames
+SHELL_FRAME      = 15000   # shell alloca frames (above shell code)
 PROG_FRAME       = 4400    # user program alloca frames
 
 # ── Directory entry field offsets ────────────────────────────────────────────
