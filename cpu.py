@@ -1,6 +1,6 @@
 import os
 from types import SimpleNamespace
-from multiprocessing import Process, Event, Lock, JoinableQueue, RawArray, Value
+from multiprocessing import Process, Event, Lock, JoinableQueue, Queue, RawArray, Value
 
 
 class Trit:
@@ -521,6 +521,7 @@ class Core(Process):
         self._s_gpu_queue = system.gpu_queue
         self._s_gpu_opc = system._gpu_opcount
         self._s_io_lock = system.io_lock
+        self._s_io_out_q = system._io_out_q
         self._s_step = system._step_counts[core_id]
         self._s_vbuf_alloc = system.vbuffer_alloc
         self._s_vbuf_off = system.vbuffer_offset
@@ -582,6 +583,7 @@ class Core(Process):
             io_lock=self._s_io_lock,
             io_in=[],
             io_out=[],
+            _io_out_q=self._s_io_out_q,
             _step_counts=step_counts,
             _gpu_opcount=self._s_gpu_opc,
             vbuffer_alloc=self._s_vbuf_alloc,
@@ -654,7 +656,7 @@ class Core(Process):
             return
 
         psr = int(self.PSR)
-        if psr == 3:    # trit[1]=+1 → restart
+        if psr == 3:  # trit[1]=+1 → restart
             self.system.stop_all()
             self.system.start_all()
             return
@@ -680,7 +682,7 @@ class Core(Process):
         reftype = header[8:16]  # same word as the opcode/count -- no separate fetch
         operands = []
 
-        for i in range(op_count):
+        for i in range(op_count):  # type: ignore
             word = self.system.mem.get(base + 1 + i)
             value = int(word)
             tag = reftype.trits[i].get()
@@ -691,13 +693,13 @@ class Core(Process):
 
         func = self.isa.get(opcode_str)
         if func is not None:
-            self._next_pc = base + 1 + op_count
+            self._next_pc = base + 1 + op_count  # type: ignore
             self._jumped = False
             func(self, *operands)
             if not self._jumped:
                 self.PC.from_int(self._next_pc)
         else:
-            self.PC.from_int(base + 1 + op_count)
+            self.PC.from_int(base + 1 + op_count)  # type: ignore
 
         self.system._step_counts[self.core_id].value += 1
 
@@ -737,6 +739,7 @@ class TernarySystem:
         self.io_lock = Lock()
         self.io_in = []
         self.io_out = []
+        self._io_out_q = Queue()   # cross-process; drained by drain_io_out()
 
         self.disk = Disk(disk_path, disk_size, plain=plain)
         self.bootsector = Disk(
@@ -773,6 +776,18 @@ class TernarySystem:
             core.HALTED = True
         for _ in self.gpu_cores:
             self.gpu_queue.put(None)  # one sentinel per GPU core
+
+    def drain_io_out(self) -> list:
+        """Collect all (port, value) tuples written by OUT instructions across
+        all cores since the last call.  Non-blocking; drains the shared queue."""
+        results = []
+        while not self._io_out_q.empty():
+            try:
+                results.append(self._io_out_q.get_nowait())
+            except Exception:
+                break
+        self.io_out.extend(results)
+        return results
 
     def join_all(self):
         # Ensure any running GPU cores get a shutdown sentinel so they can
@@ -1111,8 +1126,12 @@ def op_xchg(self: Core, a, b):
 
 @ternary_1.instruction("00++--")
 def op_out(self: Core, port, src):
+    entry = (self.value(port), self.value(src))
+    # Write to the cross-process queue (readable by parent via drain_io_out)
+    # and to the local list for any same-process callers.
+    self.system._io_out_q.put(entry)
     with self.system.io_lock:
-        self.system.io_out.append((self.value(port), self.value(src)))
+        self.system.io_out.append(entry)
 
 
 @ternary_1.instruction("00++-+")
@@ -1225,6 +1244,51 @@ def op_gproc(self: Core, opcode, a, b, c, d, e, f):
 def op_gsync(self: Core):
     """Block until every queued GPU job has completed."""
     self.system.gpu_queue.join()
+
+
+# ---- Disk I/O ----------------------------------------------------------
+# Sector size: 81 cells (3^4).  The virtual disk holds DEFAULT_DISK_SIZE=19683
+# cells → 243 sectors.  DISKREAD/DISKWRITE each transfer exactly one sector.
+SECTOR_SIZE = 81
+
+
+@ternary_1.instruction("0+000+")
+def op_diskread(self: Core, dst_ram, disk_sector):
+    """Read one sector (SECTOR_SIZE cells) from disk into RAM.
+
+    dst_ram    — RAM address of the first cell to write (register or immediate)
+    disk_sector — sector index on disk (register or immediate)
+    """
+    ram_base    = self.value(dst_ram)
+    sector_num  = self.value(disk_sector)
+    disk_base   = sector_num * SECTOR_SIZE
+    disk        = self.system.disk
+    for i in range(SECTOR_SIZE):
+        word = disk.get(disk_base + i)          # acquires disk.lock briefly
+        self.system.mem.set(ram_base + i, word) # acquires mem._lock briefly
+
+
+@ternary_1.instruction("0+00-0")
+def op_diskwrite(self: Core, src_ram, disk_sector):
+    """Write one sector (SECTOR_SIZE cells) from RAM to disk.
+
+    src_ram    — RAM address of the first cell to read (register or immediate)
+    disk_sector — sector index on disk (register or immediate)
+    """
+    ram_base    = self.value(src_ram)
+    sector_num  = self.value(disk_sector)
+    disk_base   = sector_num * SECTOR_SIZE
+    disk        = self.system.disk
+    for i in range(SECTOR_SIZE):
+        word = self.system.mem.get(ram_base + i)
+        disk.set(disk_base + i, word)
+
+
+@ternary_1.instruction("0+00-+")
+def op_disksize(self: Core, dst):
+    """Load the total number of disk sectors into dst."""
+    n_sectors = self.system.disk.size // SECTOR_SIZE
+    self.r(dst).from_int(n_sectors)
 
 
 # ---- Shared State & Multicore Concurrency ------------------------------
