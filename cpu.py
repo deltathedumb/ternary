@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from multiprocessing import Process, Event, Lock, JoinableQueue, Queue, RawArray, Value
 
 
+
 class Trit:
     HI = 1
     LO = -1
@@ -425,6 +426,7 @@ def encode_instruction(opcode: str, operands: list) -> "list[Trite]":
     return words
 
 
+
 # =========================
 # GPU CORE (multiprocessing worker -- drains gpu_queue)
 # =========================
@@ -520,9 +522,10 @@ class Core(Process):
         self._s_boot_plain = system.bootsector.plain
         self._s_gpu_queue = system.gpu_queue
         self._s_gpu_opc = system._gpu_opcount
-        self._s_io_lock = system.io_lock
+        self._s_io_lock  = system.io_lock
         self._s_io_out_q = system._io_out_q
         self._s_io_in_q  = system._io_in_q
+
         self._s_step = system._step_counts[core_id]
         self._s_vbuf_alloc = system.vbuffer_alloc
         self._s_vbuf_off = system.vbuffer_offset
@@ -1134,8 +1137,6 @@ def op_xchg(self: Core, a, b):
 @ternary_1.instruction("00++--")
 def op_out(self: Core, port, src):
     entry = (self.value(port), self.value(src))
-    # Write to the cross-process queue (readable by parent via drain_io_out)
-    # and to the local list for any same-process callers.
     self.system._io_out_q.put(entry)
     with self.system.io_lock:
         self.system.io_out.append(entry)

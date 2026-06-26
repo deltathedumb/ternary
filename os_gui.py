@@ -1,12 +1,16 @@
 """
 os_gui.py — GUI OS runner for the ternary computer.
 
-Usage:
-    python os_gui.py [--build-dir <dir>]  (default: ./os_build)
+The ternary CPU renders text directly into the shared video memory (vmem)
+via the TextTerminal hardware class in cpu.py.  This window just blits
+the raw framebuffer — the display is driven by the simulated system.
 
-A pygame window split into two panels:
-  Left:  terminal — OS boot log and program output (OUT port 0)
-  Right: live stats — CPU state, IPS, elapsed time, memory
+Layout  (matches display.py):
+  Left  486×384   vmem framebuffer scaled 2× from 243×192
+  Right 264×384   live stats panel
+
+Usage:
+    python os_gui.py [--build-dir <dir>]   (default: ./os_build)
 """
 
 import argparse
@@ -14,6 +18,7 @@ import pathlib
 import struct
 import sys
 import time
+from multiprocessing import Array as MPArray
 
 import pygame
 
@@ -25,27 +30,54 @@ if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
 from cpu import TernarySystem, ternary_1
+from text_terminal import TextTerminal
 
-# ── Layout ─────────────────────────────────────────────────────────────────────
-TERM_W   = 520
-STATS_W  = 260
-WIN_W    = TERM_W + STATS_W
-WIN_H    = 480
-FPS      = 30
-PADDING  = 10
+# ── Video layout (must match TextTerminal constants in cpu.py) ─────────────────
+VRAM_W  = 243
+VRAM_H  = 192
+SCALE   = 2
+VIDEO_W = VRAM_W * SCALE   # 486
+VIDEO_H = VRAM_H * SCALE   # 384
+STATS_W = 264
+WIN_W   = VIDEO_W + STATS_W
+WIN_H   = VIDEO_H
+FPS     = 30
 
 # ── Palette ───────────────────────────────────────────────────────────────────
-BG_TERM  = (10,  12,  18)
-BG_STATS = (18,  20,  28)
-CYAN     = (70,  210, 255)
-YELLOW   = (255, 235, 60)
-GREEN    = (70,  240, 120)
-ORANGE   = (255, 170, 50)
-RED      = (255, 70,  70)
-WHITE    = (230, 230, 235)
-GRAY     = (130, 135, 148)
-DIVIDER  = (45,  48,  62)
-PROMPT   = (80,  200, 120)
+BG      = (18,  20,  28)
+CYAN    = (70,  210, 255)
+YELLOW  = (255, 235, 60)
+GREEN   = (70,  240, 120)
+ORANGE  = (255, 170, 50)
+RED     = (255, 70,  70)
+WHITE   = (230, 230, 235)
+GRAY    = (130, 135, 148)
+DIVIDER = (45,  48,  62)
+
+
+# ── Font generation ───────────────────────────────────────────────────────────
+
+def _build_font() -> MPArray:
+    """Rasterise ASCII 0–127 into 8×8 bitmap glyphs using pygame.
+    Returns a multiprocessing.Array('B', 128*8) — one byte per glyph row."""
+    try:
+        font = pygame.font.SysFont("Courier New", 11, bold=True)
+    except Exception:
+        font = pygame.font.Font(None, 11)
+
+    data = MPArray('B', 128 * 8)
+    for ch in range(128):
+        c = chr(ch) if 32 <= ch < 127 else ' '
+        glyph = font.render(c, False, (255, 255, 255), (0, 0, 0))
+        glyph = pygame.transform.scale(glyph, (8, 8))
+        arr   = pygame.surfarray.array2d(glyph)   # shape (width=8, height=8)
+        for row in range(8):
+            bits = 0
+            for col in range(8):
+                if arr[col, row] != 0:
+                    bits |= (1 << (7 - col))
+            data[ch * 8 + row] = bits
+    return data
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -55,98 +87,11 @@ def load_tern_words(path: pathlib.Path) -> list[int]:
     return list(struct.unpack_from(f"<{len(raw)//4}i", raw))
 
 
-def _wrap_line(text: str, font, max_w: int) -> list[str]:
-    """Split a string into lines that fit within max_w pixels."""
-    if not text:
-        return [""]
-    words = text.split(" ")
-    lines, cur = [], ""
-    for w in words:
-        candidate = (cur + " " + w).lstrip()
-        if font.size(candidate)[0] <= max_w:
-            cur = candidate
-        else:
-            if cur:
-                lines.append(cur)
-            cur = w
-    if cur:
-        lines.append(cur)
-    return lines or [""]
-
-
-# ── Terminal ──────────────────────────────────────────────────────────────────
-
-class Terminal:
-    """Scrollable text terminal rendered onto a Surface."""
-
-    def __init__(self, surface: pygame.Surface, font: pygame.font.Font):
-        self.surf = surface
-        self.font = font
-        self.lh = font.get_height() + 2
-        self.max_w = surface.get_width() - PADDING * 2
-        self.lines: list[tuple[str, tuple]] = []  # (text, color)
-        self.scroll = 0          # lines scrolled from bottom
-
-    def write(self, text: str, color=WHITE):
-        for line in _wrap_line(text, self.font, self.max_w):
-            self.lines.append((line, color))
-
-    def blank(self):
-        self.lines.append(("", WHITE))
-
-    def append_char(self, ch: str) -> None:
-        """Stream a single character into the terminal (from CPU port 1 output)."""
-        if not ch:
-            return
-        if ch == "\n":
-            # Flush the current pending line and start fresh
-            if not self.lines or self.lines[-1][1] != GREEN:
-                self.lines.append(("", GREEN))
-            self.lines.append(("", GREEN))
-            self.scroll = 0   # auto-scroll to bottom on new output
-            return
-        if ch == "\b":
-            # Backspace: remove last char from the last line
-            if self.lines and self.lines[-1][1] == GREEN:
-                t, c = self.lines[-1]
-                if t:
-                    self.lines[-1] = (t[:-1], c)
-            return
-        # Append char to the last line (or start one)
-        if not self.lines or self.lines[-1][1] != GREEN:
-            self.lines.append(("", GREEN))
-        t, c = self.lines[-1]
-        self.lines[-1] = (t + ch, c)
-
-    def render(self):
-        self.surf.fill(BG_TERM)
-        visible = self.surf.get_height() // self.lh
-        start = max(0, len(self.lines) - visible - self.scroll)
-        end   = min(len(self.lines), start + visible)
-        for row, (text, color) in enumerate(self.lines[start:end]):
-            self.surf.blit(self.font.render(text, True, color),
-                           (PADDING, PADDING + row * self.lh))
-
-    def scroll_up(self, n=3):
-        max_scroll = max(0, len(self.lines) - (self.surf.get_height() // self.lh))
-        self.scroll = min(self.scroll + n, max_scroll)
-
-    def scroll_down(self, n=3):
-        self.scroll = max(0, self.scroll - n)
-
-    def scroll_home(self):
-        max_scroll = max(0, len(self.lines) - (self.surf.get_height() // self.lh))
-        self.scroll = max_scroll
-
-    def scroll_end(self):
-        self.scroll = 0
-
-
 # ── Stats panel ───────────────────────────────────────────────────────────────
 
 def render_stats(surf: pygame.Surface, fonts, system: TernarySystem,
-                 state: dict, fps: float, elapsed: float):
-    surf.fill(BG_STATS)
+                 state: dict, fps: float, elapsed: float) -> None:
+    surf.fill(BG)
     font_hd, font_sm = fonts
     lh_hd = font_hd.get_height() + 3
     lh_sm = font_sm.get_height() + 2
@@ -171,7 +116,6 @@ def render_stats(surf: pygame.Surface, fonts, system: TernarySystem,
     line("TERNARY OS", CYAN, big=True)
     divider()
 
-    # CPU cores
     now = time.monotonic()
     dt  = now - state["prev_time"]
     state["prev_time"] = now
@@ -191,39 +135,28 @@ def render_stats(surf: pygame.Surface, fonts, system: TernarySystem,
         line(f"  Core {i}  {tag}", col)
     divider()
 
-    # Timing
     line("TIMING", YELLOW)
     gap(2)
-    line(f"  Elapsed    {elapsed:>8.3f} s", WHITE)
-    line(f"  FPS        {fps:>8.1f}", GRAY)
+    line(f"  Elapsed  {elapsed:>8.3f} s", WHITE)
+    line(f"  FPS      {fps:>8.1f}", GRAY)
     divider()
 
-    # Memory
-    line("MEMORY", YELLOW)
+    line("DISPLAY", YELLOW)
     gap(2)
-    line(f"  RAM        {len(system.mem._raw):>6,} words", WHITE)
-    if hasattr(system, 'disk') and system.disk is not None:
-        line(f"  Disk       {system.disk.size:>6,} cells", GRAY)
-    divider()
-
-    # ISA
-    line("ISA", YELLOW)
-    gap(2)
-    line(f"  Instructions {len(ternary_1.instructions):>3}", WHITE)
+    line(f"  {VRAM_W}x{VRAM_H} @ {SCALE}x scale", GRAY)
+    line(f"  30 cols x 24 rows", GRAY)
     divider()
 
     gap(2)
     line("  [ESC]    quit", GRAY)
-    line("  [scroll] terminal", GRAY)
-    line("  [Home/End] jump", GRAY)
+    line("  [type]   shell input", GRAY)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-def run_gui(build_dir: pathlib.Path):
+def run_gui(build_dir: pathlib.Path) -> None:
     boot_path = build_dir / "bootsector.tern"
     disk_path = build_dir / "ternary.disk"
-
     for p in (boot_path, disk_path):
         if not p.exists():
             print(f"ERROR: {p} not found — run build_os.py first")
@@ -234,29 +167,22 @@ def run_gui(build_dir: pathlib.Path):
     screen = pygame.display.set_mode((WIN_W, WIN_H))
     clock  = pygame.time.Clock()
 
+    # Build font BEFORE creating TernarySystem so child process gets it.
+    font_data = _build_font()
+
     try:
         font_hd = pygame.font.SysFont("Courier New", 13, bold=True)
         font_sm = pygame.font.SysFont("Courier New", 12)
-        font_tr = pygame.font.SysFont("Courier New", 12)
     except Exception:
         font_hd = pygame.font.Font(None, 18)
         font_sm = pygame.font.Font(None, 16)
-        font_tr = pygame.font.Font(None, 16)
     fonts = (font_hd, font_sm)
 
-    term_surf  = pygame.Surface((TERM_W, WIN_H))
+    # The video surface receives the raw vmem blit (grayscale, scaled 2x).
+    video_surf = pygame.Surface((VRAM_W, VRAM_H))
     stats_surf = pygame.Surface((STATS_W, WIN_H))
-    term = Terminal(term_surf, font_tr)
 
-    # Boot the OS
-    term.write("TERNARY OS RUNNER", CYAN)
-    term.write("-" * 36, DIVIDER)
-    term.blank()
-    term.write(f"disk:       {disk_path.name}", GRAY)
-    term.write(f"bootsector: {boot_path.name}", GRAY)
-    term.blank()
-    term.write("Booting...", YELLOW)
-
+    # Create and boot the system.
     system = TernarySystem(
         ternary_1,
         num_cores=1,
@@ -264,12 +190,10 @@ def run_gui(build_dir: pathlib.Path):
         disk_path=str(disk_path),
         disk_size=19683,
     )
+    terminal = TextTerminal(system.vmem, font_data)
     boot_words = load_tern_words(boot_path)
     for i, w in enumerate(boot_words):
         system.mem.set(i, w)
-
-    term.write(f"Bootsector: {len(boot_words)} words -> RAM[0]", GRAY)
-    term.blank()
 
     system.start_all()
     t_start = time.monotonic()
@@ -280,12 +204,8 @@ def run_gui(build_dir: pathlib.Path):
         "prev_time":  time.monotonic(),
         "prev_steps": [0] * len(system.cores),
     }
-
     fps = 0.0
     t_last_fps = time.monotonic()
-
-    # Input line buffer (for rendering the current input line)
-    input_buf: list[str] = []
 
     running = True
     while running:
@@ -298,48 +218,22 @@ def run_gui(build_dir: pathlib.Path):
                     running = False
                 elif event.key == pygame.K_RETURN:
                     system.push_input(13)
-                    input_buf.clear()
                 elif event.key == pygame.K_BACKSPACE:
                     system.push_input(8)
-                    if input_buf:
-                        input_buf.pop()
                 elif event.unicode and event.unicode.isprintable():
-                    ch = ord(event.unicode)
-                    system.push_input(ch)
-                    input_buf.append(event.unicode)
-            elif event.type == pygame.MOUSEWHEEL:
-                mx, _ = pygame.mouse.get_pos()
-                if mx < TERM_W:
-                    if event.y > 0:
-                        term.scroll_up(event.y * 3)
-                    else:
-                        term.scroll_down(-event.y * 3)
+                    system.push_input(ord(event.unicode))
 
-        # ── Poll CPU output ────────────────────────────────────────────────────
-        new_out = system.drain_io_out()
-        for port, value in new_out:
+        # ── Drain output -> terminal ──────────────────────────────────────────
+        for port, value in system.drain_io_out():
             if port == 1:
-                # Character output from shell (print_char)
-                term.append_char(chr(value) if 32 <= value < 127 else
-                                 "\n"       if value == 10          else
-                                 "\b"       if value == 8           else "")
-            elif port == 0:
-                term.write(str(value), GREEN)
+                terminal.write_char(value)
 
         # ── Detect halt ───────────────────────────────────────────────────────
         if not halted:
             core = system.cores[0]
             if not core.is_alive() or core.HALTED:
-                halted = True
-                t_halt = time.monotonic()
-                elapsed = t_halt - t_start
-                term.blank()
-                term.write(f"CPU halted  ({elapsed:.3f}s)", ORANGE)
-                term.write("Press ESC to quit.", GRAY)
-                # Drain any remaining output
-                for port, value in system.drain_io_out():
-                    if port == 0:
-                        term.write(str(value), GREEN)
+                halted  = True
+                t_halt  = time.monotonic()
 
         # ── FPS ───────────────────────────────────────────────────────────────
         now = time.monotonic()
@@ -349,27 +243,39 @@ def run_gui(build_dir: pathlib.Path):
         t_last_fps = now
         elapsed = (t_halt or now) - t_start
 
-        # ── Render ────────────────────────────────────────────────────────────
-        term.render()
-        render_stats(stats_surf, fonts, system, perf_state, fps, elapsed)
+        # ── Video: blit raw vmem → screen ─────────────────────────────────────
+        raw = system.vmem._raw
+        pxa = pygame.PixelArray(video_surf)
+        with system.vmem.lock:
+            idx = 0
+            for yy in range(VRAM_H):
+                for xx in range(VRAM_W):
+                    t_val = raw[idx]
+                    idx  += 1
+                    # Map [-121, 121] → [0, 255], render as green channel
+                    c = int((t_val + 121) * 1.0537)
+                    c = max(0, min(255, c))
+                    pxa[xx, yy] = (0 << 16) | (c << 8) | 0
+        pxa.close()
+        scaled = pygame.transform.scale(video_surf, (VIDEO_W, VIDEO_H))
+        screen.blit(scaled, (0, 0))
 
-        screen.blit(term_surf,  (0,      0))
-        screen.blit(stats_surf, (TERM_W, 0))
-        pygame.draw.line(screen, DIVIDER, (TERM_W, 0), (TERM_W, WIN_H), 2)
+        # ── Stats ─────────────────────────────────────────────────────────────
+        render_stats(stats_surf, fonts, system, perf_state, fps, elapsed)
+        screen.blit(stats_surf, (VIDEO_W, 0))
+        pygame.draw.line(screen, DIVIDER, (VIDEO_W, 0), (VIDEO_W, WIN_H), 2)
 
         pygame.display.flip()
         clock.tick(FPS)
 
-    # ── Shutdown ──────────────────────────────────────────────────────────────
     system.stop_all()
     system.join_all()
     pygame.quit()
 
 
-def main():
-    ap = argparse.ArgumentParser(description="GUI OS runner for the ternary computer")
-    ap.add_argument("--build-dir", default="os_build",
-                    help="Directory containing bootsector.tern and ternary.disk")
+def main() -> None:
+    ap = argparse.ArgumentParser(description="GUI OS runner — vmem display")
+    ap.add_argument("--build-dir", default="os_build")
     args = ap.parse_args()
     run_gui(_HERE / args.build_dir)
 
