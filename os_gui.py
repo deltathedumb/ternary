@@ -232,6 +232,12 @@ def run_gui(build_dir: pathlib.Path) -> None:
         scaled = pygame.transform.scale(video_surf, (VIDEO_W, VIDEO_H))
         screen.blit(scaled, (0, 0))
 
+        # ── Blinking cursor ───────────────────────────────────────────────────
+        if not halted and int(now * 2) % 2 == 0:
+            cur_x = terminal.cx * 8 * SCALE
+            cur_y = (terminal.cy * 8 + 6) * SCALE
+            pygame.draw.rect(screen, GREEN, (cur_x, cur_y, 8 * SCALE, 2 * SCALE))
+
         # ── Stats ─────────────────────────────────────────────────────────────
         render_stats(stats_surf, fonts, system, perf_state, fps, elapsed)
         screen.blit(stats_surf, (VIDEO_W, 0))

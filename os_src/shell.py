@@ -40,13 +40,9 @@ def diskwrite(buf: int, sector: int) -> int:
 
 
 # ── Integer output ────────────────────────────────────────────────────────────
-
-def _print_digits(n: int) -> int:
-    if n == 0:
-        return 0
-    _print_digits(n // 10)
-    print_char(n % 10 + 48)
-    return 0
+# Uses RAM[5900..5909] as a digit stack (max 10 decimal digits).
+# Recursion is not used because static frame allocation does not support it:
+# recursive calls overwrite the caller's local variables in the shared frame.
 
 def print_int(n: int) -> int:
     if n == 0:
@@ -55,7 +51,15 @@ def print_int(n: int) -> int:
     if n < 0:
         print_char(45)
         n = 0 - n
-    _print_digits(n)
+    dlen = 0
+    while n > 0:
+        mem_store(5900 + dlen, n % 10)
+        dlen = dlen + 1
+        n = n // 10
+    i = dlen - 1
+    while i >= 0:
+        print_char(mem_load(5900 + i) + 48)
+        i = i - 1
     return 0
 
 
